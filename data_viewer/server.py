@@ -6,6 +6,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -19,19 +20,20 @@ HERE = Path(__file__).parent
 PIPELINE_SCRIPT = HERE.parent / "traj_pipeline" / "download_and_run.py"
 STATIC_DIR = HERE / "static"
 CONFIG_FILE = HERE / "config.json"
+TASKS_FILE = HERE / "tasks.json"
 STATS_FILE_NAME = "filter_stats.json"
 
 DEFAULT_CONFIG = {
-    "assistant_obs": "obs://rl-agentdata/zhengnianzu/test/session_analysis/env-claude-99oR/key-6fda/ex-260714192731/",
-    "evaluator_obs": "obs://rl-agentdata/zhengnianzu/test/session_analysis/env-claude-99oR/key-b771/ex-260716211014/",
-    "output_dir": str(HERE / "pipeline_output"),
-    "obsutil_path": "/home/ma-user/obsutil/obsutil",
-    "refresh_interval_minutes": 30,
+    "output_base_dir": str(HERE / "pipeline_output"),
+    "obsutil_path": "/home/w00802407/obsutil/obsutil",
     "port": 8080,
 }
 
+STAT_SUM_KEYS = ["filtered_count", "with_eval_count", "completion_ge_0.5", "completion_eq_1", "dropped_count"]
+
 _job_lock = threading.Lock()
 _job_state = {
+    "task_id": None,
     "running": False,
     "started_at": None,
     "progress": "",
@@ -42,6 +44,8 @@ _job_state = {
     "last_exit_code": None,
 }
 _LOG_TAIL_MAX = 40
+
+_tasks_lock = threading.Lock()
 
 
 def load_config() -> dict:
@@ -54,12 +58,84 @@ def load_config() -> dict:
     return DEFAULT_CONFIG.copy()
 
 
-def stats_path() -> Path:
-    return Path(load_config()["output_dir"]) / STATS_FILE_NAME
+# ── 任务注册表 ────────────────────────────────────────────────────────────────
+def load_tasks() -> list:
+    with _tasks_lock:
+        if not TASKS_FILE.exists():
+            return []
+        with open(TASKS_FILE, encoding="utf-8") as f:
+            return json.load(f).get("tasks", [])
 
 
-def origin_dir() -> Path:
-    return Path(load_config()["output_dir"]) / "origin"
+def save_tasks(tasks: list):
+    with _tasks_lock:
+        with open(TASKS_FILE, "w", encoding="utf-8") as f:
+            json.dump({"tasks": tasks}, f, ensure_ascii=False, indent=2)
+
+
+def find_task(task_id: str) -> Optional[dict]:
+    for t in load_tasks():
+        if t["id"] == task_id:
+            return t
+    return None
+
+
+def update_task(task_id: str, **fields):
+    tasks = load_tasks()
+    for t in tasks:
+        if t["id"] == task_id:
+            t.update(fields)
+            break
+    save_tasks(tasks)
+
+
+def migrate_legacy_task_if_needed():
+    """首次启动时, 若已存在旧版单数据源跑出来的 pipeline_output/filter_stats.json,
+    把它包装成一个"历史数据"任务, 不移动/不重跑, 只是纳入任务列表。"""
+    if TASKS_FILE.exists():
+        return
+
+    cfg = load_config()
+    legacy_output_dir = Path(cfg["output_base_dir"])
+    legacy_stats = legacy_output_dir / STATS_FILE_NAME
+
+    tasks = []
+    if legacy_stats.exists():
+        # 旧 config.json(改造前)里可能还留着 assistant_obs/evaluator_obs, 尽力找回填充展示用
+        assistant_obs = ""
+        evaluator_obs = ""
+        try:
+            with open(CONFIG_FILE, encoding="utf-8") as f:
+                old_cfg = json.load(f)
+            assistant_obs = old_cfg.get("assistant_obs", "")
+            evaluator_obs = old_cfg.get("evaluator_obs", "")
+        except Exception:
+            pass
+
+        mtime = datetime.fromtimestamp(legacy_stats.stat().st_mtime).isoformat()
+        tasks.append({
+            "id": "legacy",
+            "name": "历史数据（迁移导入）",
+            "assistant_obs": assistant_obs,
+            "evaluator_obs": evaluator_obs,
+            "output_dir": str(legacy_output_dir),
+            "created_at": mtime,
+            "last_run_time": mtime,
+            "last_duration_seconds": None,
+            "last_exit_code": 0,
+            "last_error": None,
+        })
+
+    save_tasks(tasks)
+
+
+# ── 按任务定位数据文件 ──────────────────────────────────────────────────────────
+def stats_path(output_dir: str) -> Path:
+    return Path(output_dir) / STATS_FILE_NAME
+
+
+def origin_dir(output_dir: str) -> Path:
+    return Path(output_dir) / "origin"
 
 
 _TS_RE = re.compile(r"(\d{4}-\d{2}-\d{2})[_T](\d{2})[-:](\d{2})[-:](\d{2})")
@@ -78,12 +154,12 @@ def _latest_json(session_dir: Path) -> Optional[Path]:
     return sorted(files, key=ts)[-1]
 
 
-def find_session_json(session: str) -> Optional[Path]:
+def find_session_json(session: str, output_dir: str) -> Optional[Path]:
     """在 <output_dir>/origin/*/<session>/ 下查找该 session 的最新原始轨迹 json。
     assistant 目录名每次下载会变(取决于 obs 路径末段), 所以用通配符搜, 不写死目录名。"""
     if "/" in session or ".." in session:
         return None
-    for candidate in origin_dir().glob(f"*/{session}"):
+    for candidate in origin_dir(output_dir).glob(f"*/{session}"):
         if candidate.is_dir():
             found = _latest_json(candidate)
             if found:
@@ -139,6 +215,7 @@ def _simplify_message(msg: dict) -> dict:
     return out
 
 
+# ── 流水线执行(全局同一时刻只允许一个任务在跑) ──────────────────────────────────
 def _append_log_line(line: str):
     """流水线子进程用 \\r 刷新下载进度行, 也用 \\n 输出常规日志。
     两者都要能实时体现在 job_state 里: 最新一行当作 progress, 历史行滚动进 log_tail。"""
@@ -179,54 +256,67 @@ def _stream_subprocess(cmd):
     return proc.returncode, "\n".join(all_output)
 
 
-def run_pipeline():
+def run_pipeline(task_id: str):
+    task = find_task(task_id)
+    if not task:
+        return
+
     with _job_lock:
         if _job_state["running"]:
             return
         _job_state["running"] = True
+        _job_state["task_id"] = task_id
         _job_state["started_at"] = datetime.now().isoformat()
         _job_state["progress"] = "正在启动..."
         _job_state["log_tail"] = []
         _job_state["last_error"] = None
 
     t0 = time.time()
+    cfg = load_config()
+    out_dir = task["output_dir"]
     try:
-        cfg = load_config()
-        out_dir = cfg["output_dir"]
         os.makedirs(out_dir, exist_ok=True)
         cmd = [
             sys.executable,
             "-u",
             str(PIPELINE_SCRIPT),
-            cfg["assistant_obs"],
-            cfg["evaluator_obs"],
+            task["assistant_obs"],
+            task["evaluator_obs"],
             out_dir,
             "--obsutil", cfg["obsutil_path"],
         ]
         exit_code, full_output = _stream_subprocess(cmd)
+        last_run_time = datetime.now().isoformat()
+        last_duration = round(time.time() - t0, 1)
+        last_error = None
+        if exit_code != 0:
+            last_error = full_output[-3000:].strip()
         with _job_lock:
-            _job_state["last_run_time"] = datetime.now().isoformat()
-            _job_state["last_duration_seconds"] = round(time.time() - t0, 1)
+            _job_state["last_run_time"] = last_run_time
+            _job_state["last_duration_seconds"] = last_duration
             _job_state["last_exit_code"] = exit_code
-            if exit_code != 0:
-                _job_state["last_error"] = full_output[-3000:].strip()
+            _job_state["last_error"] = last_error
     except Exception as exc:
+        last_run_time = datetime.now().isoformat()
+        last_duration = round(time.time() - t0, 1)
+        exit_code = None
+        last_error = str(exc)
         with _job_lock:
-            _job_state["last_run_time"] = datetime.now().isoformat()
-            _job_state["last_duration_seconds"] = round(time.time() - t0, 1)
-            _job_state["last_error"] = str(exc)
+            _job_state["last_run_time"] = last_run_time
+            _job_state["last_duration_seconds"] = last_duration
+            _job_state["last_error"] = last_error
     finally:
         with _job_lock:
             _job_state["running"] = False
             _job_state["started_at"] = None
 
-
-def _scheduler_loop():
-    while True:
-        cfg = load_config()
-        interval = max(1, cfg.get("refresh_interval_minutes", 30)) * 60
-        time.sleep(interval)
-        run_pipeline()
+    update_task(
+        task_id,
+        last_run_time=last_run_time,
+        last_duration_seconds=last_duration,
+        last_exit_code=exit_code,
+        last_error=last_error,
+    )
 
 
 app = FastAPI(title="Trajectory Viewer")
@@ -234,31 +324,125 @@ app = FastAPI(title="Trajectory Viewer")
 
 @app.on_event("startup")
 def _startup():
-    t = threading.Thread(target=_scheduler_loop, daemon=True)
-    t.start()
+    migrate_legacy_task_if_needed()
+
+
+def _task_summary(task: dict) -> dict:
+    p = stats_path(task["output_dir"])
+    summary = dict(task)
+    if p.exists():
+        with open(p, encoding="utf-8") as f:
+            data = json.load(f)
+        summary["available"] = True
+        summary["session_total"] = len(data.get("per_session", []))
+        for k in STAT_SUM_KEYS:
+            summary[k] = data.get(k, 0)
+    else:
+        summary["available"] = False
+        summary["session_total"] = 0
+        for k in STAT_SUM_KEYS:
+            summary[k] = 0
+    return summary
+
+
+@app.get("/api/tasks")
+def api_list_tasks():
+    return {"tasks": [_task_summary(t) for t in load_tasks()]}
+
+
+@app.post("/api/tasks")
+def api_create_task(body: dict):
+    name = (body.get("name") or "").strip()
+    assistant_obs = (body.get("assistant_obs") or "").strip()
+    evaluator_obs = (body.get("evaluator_obs") or "").strip()
+    if not name or not assistant_obs or not evaluator_obs:
+        return JSONResponse(
+            {"success": False, "message": "任务名称、assistant OBS 地址、eval OBS 地址均不能为空"},
+            status_code=400,
+        )
+
+    cfg = load_config()
+    task_id = "t_" + uuid.uuid4().hex[:8]
+    output_dir = str(Path(cfg["output_base_dir"]) / "tasks" / task_id)
+    task = {
+        "id": task_id,
+        "name": name,
+        "assistant_obs": assistant_obs,
+        "evaluator_obs": evaluator_obs,
+        "output_dir": output_dir,
+        "created_at": datetime.now().isoformat(),
+        "last_run_time": None,
+        "last_duration_seconds": None,
+        "last_exit_code": None,
+        "last_error": None,
+    }
+    tasks = load_tasks()
+    tasks.append(task)
+    save_tasks(tasks)
+
+    with _job_lock:
+        already_running = _job_state["running"]
+    if already_running:
+        return {
+            "success": True,
+            "task": task,
+            "started": False,
+            "message": "任务已创建，但当前有其他任务正在采集中，请稍后在任务列表手动点击「重新采集」",
+        }
+
+    threading.Thread(target=run_pipeline, args=(task_id,), daemon=True).start()
+    return {"success": True, "task": task, "started": True, "message": "任务已创建，正在采集数据"}
+
+
+@app.post("/api/tasks/{task_id}/trigger")
+def api_trigger_task(task_id: str):
+    task = find_task(task_id)
+    if not task:
+        return JSONResponse({"success": False, "message": "任务不存在"}, status_code=404)
+    with _job_lock:
+        if _job_state["running"]:
+            return {"success": False, "message": "已有任务正在采集中，请稍候"}
+    threading.Thread(target=run_pipeline, args=(task_id,), daemon=True).start()
+    return {"success": True, "message": "已开始采集"}
 
 
 @app.get("/api/stats")
 def api_stats():
-    p = stats_path()
-    if not p.exists():
-        return JSONResponse({"available": False, "message": "尚无数据，请先运行流水线"})
-    with open(p, encoding="utf-8") as f:
-        data = json.load(f)
-    summary = {k: v for k, v in data.items() if k != "per_session"}
-    summary["available"] = True
-    summary["session_total"] = len(data.get("per_session", []))
+    """跨所有已登记任务的汇总统计。"""
+    tasks = load_tasks()
+    summary = {k: 0 for k in STAT_SUM_KEYS}
+    session_total = 0
+    available = False
+    for t in tasks:
+        p = stats_path(t["output_dir"])
+        if not p.exists():
+            continue
+        with open(p, encoding="utf-8") as f:
+            data = json.load(f)
+        available = True
+        session_total += len(data.get("per_session", []))
+        for k in STAT_SUM_KEYS:
+            summary[k] += data.get(k, 0)
+
+    summary["available"] = available
+    summary["session_total"] = session_total
+    summary["task_count"] = len(tasks)
     return summary
 
 
-@app.get("/api/sessions")
-def api_sessions(
+@app.get("/api/tasks/{task_id}/sessions")
+def api_task_sessions(
+    task_id: str,
     page: int = 1,
     page_size: int = 20,
     has_eval: Optional[bool] = None,
     completion_filter: Optional[str] = None,  # "ge05" | "eq1" | "no_eval"
 ):
-    p = stats_path()
+    task = find_task(task_id)
+    if not task:
+        return JSONResponse({"success": False, "message": "任务不存在"}, status_code=404)
+
+    p = stats_path(task["output_dir"])
     if not p.exists():
         return {"sessions": [], "total": 0, "page": page, "page_size": page_size, "total_pages": 0}
     with open(p, encoding="utf-8") as f:
@@ -286,10 +470,13 @@ def api_sessions(
     }
 
 
-@app.get("/api/session-detail/{session}")
-def api_session_detail(session: str):
-    """按需拉取单个 session 的原始轨迹(裁剪后), 供前端点开会话详情时懒加载, 避免一次性把全部轨迹(单条最大 700KB+)传给前端。"""
-    json_path = find_session_json(session)
+@app.get("/api/tasks/{task_id}/session-detail/{session}")
+def api_task_session_detail(task_id: str, session: str):
+    task = find_task(task_id)
+    if not task:
+        return JSONResponse({"found": False, "message": "任务不存在"}, status_code=404)
+
+    json_path = find_session_json(session, task["output_dir"])
     if not json_path:
         return JSONResponse({"found": False, "message": "未找到该会话的原始轨迹文件"}, status_code=404)
 
@@ -307,26 +494,12 @@ def api_session_detail(session: str):
     }
 
 
-@app.post("/api/trigger")
-def api_trigger():
-    with _job_lock:
-        if _job_state["running"]:
-            return {"success": False, "message": "流水线正在运行中"}
-    threading.Thread(target=run_pipeline, daemon=True).start()
-    return {"success": True, "message": "流水线已启动"}
-
-
 @app.get("/api/job-status")
 def api_job_status():
     with _job_lock:
         snap = dict(_job_state)
         snap["log_tail"] = list(_job_state["log_tail"])
         return snap
-
-
-@app.get("/api/config")
-def api_config():
-    return load_config()
 
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")

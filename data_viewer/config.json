@@ -1,8 +1,5 @@
 {
-  "assistant_obs": "obs://rl-agentdata/zhengnianzu/test/session_analysis/env-claude-99oR/key-6fda/ex-260714192731/",
-  "evaluator_obs": "obs://rl-agentdata/zhengnianzu/test/session_analysis/env-claude-99oR/key-b771/ex-260716211014/",
-  "output_dir": "./pipeline_output",
+  "output_base_dir": "./pipeline_output",
   "obsutil_path": "/home/w00802407/obsutil/obsutil",
-  "refresh_interval_minutes": 1440,
   "port": 8080
 }

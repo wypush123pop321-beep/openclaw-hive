@@ -116,6 +116,15 @@ body{
   background:rgba(0,255,168,.06);border:1px solid rgba(0,255,168,.2);border-radius:4px;padding:4px 8px;
   word-break:break-all;
 }
+.task-name-link{color:var(--neon-cyan);cursor:pointer;font-weight:600}
+.task-name-link:hover{text-decoration:underline}
+.task-obs{font-family:ui-monospace,monospace;font-size:11px;color:var(--text-2)}
+.breadcrumb{display:flex;align-items:center;gap:10px;margin-bottom:16px;font-size:13px;color:var(--text-1)}
+.breadcrumb-back{color:var(--neon-cyan);cursor:pointer;display:flex;align-items:center;gap:4px}
+.breadcrumb-back:hover{text-decoration:underline}
+.task-info-panel{display:flex;flex-direction:column;gap:4px;margin-bottom:16px}
+.task-info-name{font-size:16px;font-weight:700;color:var(--text-0)}
+.task-info-obs{font-size:11px;color:var(--text-2);font-family:ui-monospace,monospace;word-break:break-all}
 </style>
 </head>
 <body>
@@ -126,29 +135,18 @@ body{
   <div class="hdr-title">轨迹数据查看器</div>
   <div class="hdr-right">
     <el-tag v-if="jobStatus.running" type="success" size="small" style="display:flex;align-items:center;gap:4px">
-      <span class="pulse"></span> 运行中
+      <span class="pulse"></span> {{ runningTaskName }} 采集中
     </el-tag>
     <span v-if="jobStatus.running" style="font-size:11px;color:var(--neon-amber);font-family:ui-monospace,monospace">已运行 {{ elapsedSeconds }}s</span>
-    <span v-else-if="lastUpdateTime" style="font-size:11px;color:var(--text-2);font-family:ui-monospace,monospace">更新: {{ lastUpdateTime }}</span>
-    <el-button size="small" :loading="triggerLoading || jobStatus.running" @click="triggerPipeline" type="primary">
-      {{ jobStatus.running ? '运行中...' : '手动刷新' }}
-    </el-button>
-    <el-select v-model="autoRefreshMin" size="small" style="width:120px" @change="resetAutoRefresh">
-      <el-option label="自动: 关" :value="0"></el-option>
-      <el-option label="每 5 分钟" :value="5"></el-option>
-      <el-option label="每 15 分钟" :value="15"></el-option>
-      <el-option label="每 30 分钟" :value="30"></el-option>
-    </el-select>
+    <el-button size="small" type="primary" @click="openTaskForm">登记采集任务</el-button>
   </div>
 </div>
 
 <div class="content">
 
-  <!-- No data / error banners -->
-  <el-alert v-if="!stats.available && !jobStatus.running" title="尚无数据" type="info" show-icon :closable="false"
-    description="点击「手动刷新」运行流水线，或等待定时任务自动执行。" style="margin-bottom:18px"></el-alert>
+  <!-- 全局运行中 / 出错提示 -->
   <el-alert v-if="jobStatus.running" type="warning" show-icon :closable="false" style="margin-bottom:18px">
-    <template #title>流水线运行中（已运行 {{ elapsedSeconds }}s）</template>
+    <template #title>「{{ runningTaskName }}」采集中（已运行 {{ elapsedSeconds }}s）</template>
     <div class="progress-indet"></div>
     <div class="progress-line" v-if="jobStatus.progress">{{ jobStatus.progress }}</div>
     <el-collapse style="margin-top:8px" v-if="jobStatus.log_tail && jobStatus.log_tail.length">
@@ -157,79 +155,154 @@ body{
       </el-collapse-item>
     </el-collapse>
   </el-alert>
-  <el-alert v-if="jobStatus.last_error && !jobStatus.running" type="error" show-icon :closable="false" style="margin-bottom:18px">
-    <template #title>上次执行出错（退出码 {{ jobStatus.last_exit_code }}）</template>
-    <pre style="font-size:11px;white-space:pre-wrap;max-height:100px;overflow:auto;margin-top:4px">{{ jobStatus.last_error }}</pre>
-  </el-alert>
 
-  <!-- 数据总览 -->
-  <div v-if="stats.available" class="panel">
-    <div class="panel-title">数据总览</div>
-    <div v-for="f in funnelRows" :key="f.label" class="funnel-row">
-      <el-tooltip :content="f.tip" placement="top">
-        <div class="funnel-lbl">{{ f.label }}</div>
-      </el-tooltip>
-      <div class="funnel-bar">
-        <div class="funnel-fill" :style="{width:f.pct+'%',background:f.color}">
-          {{ f.pct > 9 ? f.pct + '%' : '' }}
+  <!-- ============ 总览视图 ============ -->
+  <template v-if="view === 'overview'">
+    <el-alert v-if="!stats.available && !jobStatus.running" title="尚无数据" type="info" show-icon :closable="false"
+      description="点击右上角「登记采集任务」，填写任务名称与两个 OBS 地址后即可开始采集。" style="margin-bottom:18px"></el-alert>
+
+    <div v-if="stats.available" class="panel">
+      <div class="panel-title">数据总览</div>
+      <div v-for="f in funnelRows" :key="f.label" class="funnel-row">
+        <el-tooltip :content="f.tip" placement="top">
+          <div class="funnel-lbl">{{ f.label }}</div>
+        </el-tooltip>
+        <div class="funnel-bar">
+          <div class="funnel-fill" :style="{width:f.pct+'%',background:f.color}">
+            {{ f.pct > 9 ? f.pct + '%' : '' }}
+          </div>
+        </div>
+        <div class="funnel-n" :style="{color:f.color}">{{ f.count }}</div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="tbl-hdr">
+        <div class="tbl-title">采集任务 <el-tag size="small" type="info">共 {{ tasks.length }} 个</el-tag></div>
+      </div>
+      <el-table :data="tasks" size="small" border v-loading="tasksLoading">
+        <el-table-column label="任务名称" min-width="160" show-overflow-tooltip>
+          <template #default="{row}">
+            <span class="task-name-link" @click="enterTask(row)">{{ row.name }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="Assistant OBS" min-width="200" show-overflow-tooltip>
+          <template #default="{row}"><span class="task-obs">{{ row.assistant_obs || '—' }}</span></template>
+        </el-table-column>
+        <el-table-column label="Eval OBS" min-width="200" show-overflow-tooltip>
+          <template #default="{row}"><span class="task-obs">{{ row.evaluator_obs || '—' }}</span></template>
+        </el-table-column>
+        <el-table-column label="L0/L1/L2/L3" width="150" align="center">
+          <template #default="{row}">
+            <span v-if="row.available" style="font-family:ui-monospace,monospace;font-size:12px">
+              {{ row.filtered_count }}/{{ row.with_eval_count }}/{{ row['completion_ge_0.5'] }}/{{ row.completion_eq_1 }}
+            </span>
+            <span v-else style="color:var(--text-2)">—</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="状态" width="100" align="center">
+          <template #default="{row}">
+            <el-tag v-if="jobStatus.running && jobStatus.task_id === row.id" type="warning" size="small">采集中</el-tag>
+            <el-tag v-else-if="row.last_exit_code === 0" type="success" size="small">成功</el-tag>
+            <el-tag v-else-if="row.last_exit_code !== null && row.last_exit_code !== undefined" type="danger" size="small">失败</el-tag>
+            <el-tag v-else type="info" size="small">未运行</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="100" align="center">
+          <template #default="{row}">
+            <el-button size="small" text :disabled="jobStatus.running" @click="retriggerTask(row)">重新采集</el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+    </div>
+  </template>
+
+  <!-- ============ 任务详情视图 ============ -->
+  <template v-if="view === 'task' && activeTask">
+    <div class="breadcrumb">
+      <span class="breadcrumb-back" @click="backToOverview">← 返回总览</span>
+    </div>
+    <div class="task-info-panel">
+      <div class="task-info-name">{{ activeTask.name }}</div>
+      <div class="task-info-obs">assistant: {{ activeTask.assistant_obs || '—' }}</div>
+      <div class="task-info-obs">eval: {{ activeTask.evaluator_obs || '—' }}</div>
+    </div>
+
+    <el-alert v-if="!activeTask.available && !(jobStatus.running && jobStatus.task_id === activeTaskId)" title="该任务尚无数据" type="info" show-icon :closable="false"
+      description="可能仍在采集中，或采集尚未成功，可点击下方「重新采集」。" style="margin-bottom:18px"></el-alert>
+
+    <div class="panel" v-if="activeTask.available || sessions.length">
+      <div class="tbl-hdr">
+        <div class="tbl-title">
+          会话详情
+          <el-tag size="small" type="info">共 {{ sessionsTotal }} 条</el-tag>
+        </div>
+        <div class="filters">
+          <el-select v-model="completionFilter" placeholder="全部" clearable size="small" style="width:140px" @change="onFilterChange">
+            <el-option label="全部" value=""></el-option>
+            <el-option label="有评测结果" value="has_eval"></el-option>
+            <el-option label="无评测结果" value="no_eval"></el-option>
+            <el-option label="Completion ≥ 0.5" value="ge05"></el-option>
+            <el-option label="Completion = 1" value="eq1"></el-option>
+          </el-select>
+          <el-select v-model="pageSize" size="small" style="width:90px" @change="onFilterChange">
+            <el-option :value="10" label="10 / 页"></el-option>
+            <el-option :value="20" label="20 / 页"></el-option>
+            <el-option :value="50" label="50 / 页"></el-option>
+          </el-select>
+          <el-button size="small" :disabled="jobStatus.running" @click="retriggerTask(activeTask)">重新采集</el-button>
         </div>
       </div>
-      <div class="funnel-n" :style="{color:f.color}">{{ f.count }}</div>
-    </div>
-  </div>
-
-  <!-- Sessions Table -->
-  <div v-if="stats.available" class="panel">
-    <div class="tbl-hdr">
-      <div class="tbl-title">
-        会话详情
-        <el-tag size="small" type="info">共 {{ sessionsTotal }} 条</el-tag>
-      </div>
-      <div class="filters">
-        <el-select v-model="completionFilter" placeholder="全部" clearable size="small" style="width:140px" @change="onFilterChange">
-          <el-option label="全部" value=""></el-option>
-          <el-option label="有评测结果" value="has_eval"></el-option>
-          <el-option label="无评测结果" value="no_eval"></el-option>
-          <el-option label="Completion ≥ 0.5" value="ge05"></el-option>
-          <el-option label="Completion = 1" value="eq1"></el-option>
-        </el-select>
-        <el-select v-model="pageSize" size="small" style="width:90px" @change="onFilterChange">
-          <el-option :value="10" label="10 / 页"></el-option>
-          <el-option :value="20" label="20 / 页"></el-option>
-          <el-option :value="50" label="50 / 页"></el-option>
-        </el-select>
-      </div>
-    </div>
-    <el-table :data="sessions" v-loading="loading" stripe border size="small"
-      @row-click="openDetail" style="cursor:pointer;width:100%" :row-class-name="rowClass">
-      <el-table-column type="index" width="50" label="#" align="center"></el-table-column>
-      <el-table-column prop="session" label="Session" min-width="220" show-overflow-tooltip></el-table-column>
-      <el-table-column label="评测" width="72" align="center">
-        <template #default="{row}">
-          <el-tag :type="row.has_eval?'success':'info'" size="small">{{ row.has_eval?'有':'无' }}</el-tag>
-        </template>
-      </el-table-column>
-      <el-table-column label="Completion" width="150">
-        <template #default="{row}">
-          <template v-if="row.completion!==null && row.completion!==undefined">
-            <div style="display:flex;align-items:center;gap:6px;padding:2px 0">
-              <div class="comp-bar"><div class="comp-fill" :style="{width:(row.completion*100)+'%',background:completionColor(row.completion)}"></div></div>
-              <span style="font-size:12px;min-width:34px;font-weight:600">{{ row.completion.toFixed(2) }}</span>
-            </div>
+      <el-table :data="sessions" v-loading="loading" stripe border size="small"
+        @row-click="openDetail" style="cursor:pointer;width:100%" :row-class-name="rowClass">
+        <el-table-column type="index" width="50" label="#" align="center"></el-table-column>
+        <el-table-column prop="session" label="Session" min-width="220" show-overflow-tooltip></el-table-column>
+        <el-table-column label="评测" width="72" align="center">
+          <template #default="{row}">
+            <el-tag :type="row.has_eval?'success':'info'" size="small">{{ row.has_eval?'有':'无' }}</el-tag>
           </template>
-          <span v-else style="color:var(--text-2);font-size:12px">—</span>
-        </template>
-      </el-table-column>
-      <el-table-column prop="eval_qc" label="Eval QC Trace" min-width="200" show-overflow-tooltip></el-table-column>
-    </el-table>
-    <div class="pg-wrap">
-      <el-pagination v-model:current-page="currentPage" v-model:page-size="pageSize"
-        :total="sessionsTotal" layout="total, prev, pager, next"
-        @current-change="loadSessions" background small></el-pagination>
+        </el-table-column>
+        <el-table-column label="Completion" width="150">
+          <template #default="{row}">
+            <template v-if="row.completion!==null && row.completion!==undefined">
+              <div style="display:flex;align-items:center;gap:6px;padding:2px 0">
+                <div class="comp-bar"><div class="comp-fill" :style="{width:(row.completion*100)+'%',background:completionColor(row.completion)}"></div></div>
+                <span style="font-size:12px;min-width:34px;font-weight:600">{{ row.completion.toFixed(2) }}</span>
+              </div>
+            </template>
+            <span v-else style="color:var(--text-2);font-size:12px">—</span>
+          </template>
+        </el-table-column>
+        <el-table-column prop="eval_qc" label="Eval QC Trace" min-width="200" show-overflow-tooltip></el-table-column>
+      </el-table>
+      <div class="pg-wrap">
+        <el-pagination v-model:current-page="currentPage" v-model:page-size="pageSize"
+          :total="sessionsTotal" layout="total, prev, pager, next"
+          @current-change="loadSessions" background small></el-pagination>
+      </div>
     </div>
-  </div>
+  </template>
 
 </div><!-- /content -->
+
+<!-- 登记采集任务 Dialog -->
+<el-dialog v-model="taskFormVisible" title="登记采集任务" width="560px" destroy-on-close>
+  <el-form :model="taskForm" label-position="top" @submit.prevent>
+    <el-form-item label="任务名称" required>
+      <el-input v-model="taskForm.name" placeholder="例如: 0717-口腔科普任务批次"></el-input>
+    </el-form-item>
+    <el-form-item label="Assistant 轨迹 OBS 地址" required>
+      <el-input v-model="taskForm.assistant_obs" placeholder="obs://rl-agentdata/.../ex-xxxxx/"></el-input>
+    </el-form-item>
+    <el-form-item label="Eval 轨迹 OBS 地址" required>
+      <el-input v-model="taskForm.evaluator_obs" placeholder="obs://rl-agentdata/.../ex-xxxxx/"></el-input>
+    </el-form-item>
+  </el-form>
+  <template #footer>
+    <el-button @click="taskFormVisible = false">取消</el-button>
+    <el-button type="primary" :loading="taskFormSubmitting" @click="submitTaskForm">登记并开始采集</el-button>
+  </template>
+</el-dialog>
 
 <!-- Session Detail Dialog -->
 <el-dialog v-model="detailVisible" title="会话详情" width="720px" destroy-on-close>
@@ -298,6 +371,15 @@ const { createApp } = Vue
 createApp({
   data() {
     return {
+      view: 'overview',
+      tasks: [],
+      tasksLoading: false,
+      activeTaskId: null,
+
+      taskFormVisible: false,
+      taskFormSubmitting: false,
+      taskForm: { name: '', assistant_obs: '', evaluator_obs: '' },
+
       stats: { available: false },
       sessions: [],
       sessionsTotal: 0,
@@ -305,7 +387,6 @@ createApp({
       pageSize: 20,
       completionFilter: '',
       loading: false,
-      triggerLoading: false,
       jobStatus: {},
       selectedSession: null,
       detailVisible: false,
@@ -313,8 +394,6 @@ createApp({
       trajLoaded: false,
       trajError: '',
       trajData: null,
-      autoRefreshMin: 0,
-      _autoTimer: null,
       _pollTimer: null,
       _tickTimer: null,
       nowTick: Date.now(),
@@ -322,9 +401,13 @@ createApp({
   },
 
   computed: {
-    lastUpdateTime() {
-      if (!this.jobStatus.last_run_time) return null
-      return new Date(this.jobStatus.last_run_time).toLocaleString('zh-CN')
+    activeTask() {
+      return this.tasks.find(t => t.id === this.activeTaskId) || null
+    },
+    runningTaskName() {
+      if (!this.jobStatus.running) return ''
+      const t = this.tasks.find(t => t.id === this.jobStatus.task_id)
+      return t ? t.name : (this.jobStatus.task_id || '任务')
     },
     elapsedSeconds() {
       if (!this.jobStatus.running || !this.jobStatus.started_at) return 0
@@ -336,7 +419,7 @@ createApp({
       const p = (n) => total ? Math.round((n || 0) / total * 100) : 0
       return [
         { label: '总轨迹数', count: total, pct: 100, color: '#5b6a8f',
-          tip: `下载到本地的原始轨迹总数(筛选后 ${this.stats.filtered_count || 0} + 丢弃 ${this.stats.dropped_count || 0})` },
+          tip: `所有已登记任务下载到本地的原始轨迹总数(筛选后 ${this.stats.filtered_count || 0} + 丢弃 ${this.stats.dropped_count || 0})` },
         { label: 'L0', count: this.stats.filtered_count || 0, pct: p(this.stats.filtered_count), color: '#00d9ff',
           tip: '筛选后轨迹数: 错误备注为空或仅含"200空响应"的会话，即通过基础质量筛查的轨迹' },
         { label: 'L1', count: this.stats.with_eval_count || 0, pct: p(this.stats.with_eval_count), color: '#00ffa8',
@@ -354,37 +437,95 @@ createApp({
       try { const r = await axios.get('/api/stats'); this.stats = r.data }
       catch (e) { console.error('loadStats', e) }
     },
-    async loadSessions() {
-      this.loading = true
+    async loadTasks() {
+      this.tasksLoading = true
       try {
-        const p = { page: this.currentPage, page_size: this.pageSize }
-        if (this.completionFilter === 'has_eval')  p.has_eval = true
-        else if (['no_eval','ge05','eq1'].includes(this.completionFilter)) p.completion_filter = this.completionFilter
-        const r = await axios.get('/api/sessions', { params: p })
-        this.sessions = r.data.sessions
-        this.sessionsTotal = r.data.total
-      } catch (e) { console.error('loadSessions', e) }
-      finally { this.loading = false }
+        const r = await axios.get('/api/tasks')
+        this.tasks = r.data.tasks
+      } catch (e) { console.error('loadTasks', e) }
+      finally { this.tasksLoading = false }
     },
     async loadJobStatus() {
       try { const r = await axios.get('/api/job-status'); this.jobStatus = r.data }
       catch (e) { console.error('loadJobStatus', e) }
     },
-    async triggerPipeline() {
-      this.triggerLoading = true
+    async loadSessions() {
+      if (!this.activeTaskId) return
+      this.loading = true
       try {
-        const r = await axios.post('/api/trigger')
+        const p = { page: this.currentPage, page_size: this.pageSize }
+        if (this.completionFilter === 'has_eval')  p.has_eval = true
+        else if (['no_eval','ge05','eq1'].includes(this.completionFilter)) p.completion_filter = this.completionFilter
+        const r = await axios.get(`/api/tasks/${this.activeTaskId}/sessions`, { params: p })
+        this.sessions = r.data.sessions
+        this.sessionsTotal = r.data.total
+      } catch (e) { console.error('loadSessions', e) }
+      finally { this.loading = false }
+    },
+
+    openTaskForm() {
+      this.taskForm = { name: '', assistant_obs: '', evaluator_obs: '' }
+      this.taskFormVisible = true
+    },
+    async submitTaskForm() {
+      const { name, assistant_obs, evaluator_obs } = this.taskForm
+      if (!name.trim() || !assistant_obs.trim() || !evaluator_obs.trim()) {
+        ElementPlus.ElMessage.warning('任务名称、Assistant/Eval OBS 地址均不能为空')
+        return
+      }
+      this.taskFormSubmitting = true
+      try {
+        const r = await axios.post('/api/tasks', this.taskForm)
         if (r.data.success) {
-          ElementPlus.ElMessage.success('流水线已启动，正在下载 + 处理...')
-          this.jobStatus = { ...this.jobStatus, running: true, started_at: new Date().toISOString() }
+          ElementPlus.ElMessage.success(r.data.message)
+          this.taskFormVisible = false
+          await this.loadTasks()
+          if (r.data.started) {
+            this.jobStatus = { ...this.jobStatus, running: true, task_id: r.data.task.id, started_at: new Date().toISOString() }
+            this.startTicking()
+            this.startPollUntilDone()
+          }
+        } else {
+          ElementPlus.ElMessage.error(r.data.message || '登记失败')
+        }
+      } catch (e) {
+        ElementPlus.ElMessage.error(e.response?.data?.message || '登记失败，请检查后端服务')
+      } finally {
+        this.taskFormSubmitting = false
+      }
+    },
+
+    async retriggerTask(task) {
+      try {
+        const r = await axios.post(`/api/tasks/${task.id}/trigger`)
+        if (r.data.success) {
+          ElementPlus.ElMessage.success(r.data.message)
+          this.jobStatus = { ...this.jobStatus, running: true, task_id: task.id, started_at: new Date().toISOString() }
           this.startTicking()
           this.startPollUntilDone()
         } else {
           ElementPlus.ElMessage.warning(r.data.message)
         }
-      } catch (e) { ElementPlus.ElMessage.error('触发失败，请检查后端服务') }
-      finally { this.triggerLoading = false }
+      } catch (e) {
+        ElementPlus.ElMessage.error('触发失败，请检查后端服务')
+      }
     },
+
+    enterTask(task) {
+      this.activeTaskId = task.id
+      this.view = 'task'
+      this.currentPage = 1
+      this.completionFilter = ''
+      this.sessions = []
+      this.sessionsTotal = 0
+      this.loadSessions()
+    },
+    backToOverview() {
+      this.view = 'overview'
+      this.activeTaskId = null
+      this.loadTasks()
+    },
+
     startTicking() {
       if (this._tickTimer) return
       this._tickTimer = setInterval(() => { this.nowTick = Date.now() }, 1000)
@@ -399,24 +540,17 @@ createApp({
         if (!this.jobStatus.running) {
           clearInterval(this._pollTimer); this._pollTimer = null
           this.stopTicking()
-          await this.loadStats(); await this.loadSessions()
+          await this.loadStats(); await this.loadTasks()
+          if (this.view === 'task' && this.activeTaskId === this.jobStatus.task_id) await this.loadSessions()
           if (this.jobStatus.last_exit_code === 0) {
-            ElementPlus.ElMessage.success(`流水线执行完成，用时 ${this.jobStatus.last_duration_seconds}s`)
+            ElementPlus.ElMessage.success(`采集完成，用时 ${this.jobStatus.last_duration_seconds}s`)
           } else {
-            ElementPlus.ElMessage.error('流水线执行失败，详情见页面上方错误提示')
+            ElementPlus.ElMessage.error('采集失败，详情见页面上方错误提示')
           }
         }
       }, 1500)
     },
-    resetAutoRefresh() {
-      if (this._autoTimer) { clearInterval(this._autoTimer); this._autoTimer = null }
-      if (this.autoRefreshMin > 0) {
-        this._autoTimer = setInterval(async () => {
-          await this.loadJobStatus()
-          if (!this.jobStatus.running) { await this.loadStats(); await this.loadSessions() }
-        }, this.autoRefreshMin * 60 * 1000)
-      }
-    },
+
     onFilterChange() { this.currentPage = 1; this.loadSessions() },
     openDetail(row) {
       this.selectedSession = row
@@ -427,11 +561,11 @@ createApp({
       this.trajData = null
     },
     async loadTrajectory() {
-      if (!this.selectedSession) return
+      if (!this.selectedSession || !this.activeTaskId) return
       this.trajLoading = true
       this.trajError = ''
       try {
-        const r = await axios.get(`/api/session-detail/${encodeURIComponent(this.selectedSession.session)}`)
+        const r = await axios.get(`/api/tasks/${this.activeTaskId}/session-detail/${encodeURIComponent(this.selectedSession.session)}`)
         if (r.data.found) {
           this.trajData = r.data
           this.trajLoaded = true
@@ -461,13 +595,11 @@ createApp({
   },
 
   async mounted() {
-    await Promise.all([this.loadStats(), this.loadJobStatus()])
-    if (this.stats.available) await this.loadSessions()
+    await Promise.all([this.loadTasks(), this.loadStats(), this.loadJobStatus()])
     if (this.jobStatus.running) { this.startTicking(); this.startPollUntilDone() }
   },
 
   beforeUnmount() {
-    if (this._autoTimer) clearInterval(this._autoTimer)
     if (this._pollTimer) clearInterval(this._pollTimer)
     if (this._tickTimer) clearInterval(this._tickTimer)
   },
