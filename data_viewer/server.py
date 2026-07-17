@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -55,6 +56,87 @@ def load_config() -> dict:
 
 def stats_path() -> Path:
     return Path(load_config()["output_dir"]) / STATS_FILE_NAME
+
+
+def origin_dir() -> Path:
+    return Path(load_config()["output_dir"]) / "origin"
+
+
+_TS_RE = re.compile(r"(\d{4}-\d{2}-\d{2})[_T](\d{2})[-:](\d{2})[-:](\d{2})")
+
+
+def _latest_json(session_dir: Path) -> Optional[Path]:
+    """与 traj_pipeline/run_pipeline.py 的 latest_json 逻辑一致: 取文件名时间戳最新的 json。"""
+    files = sorted(session_dir.glob("*.json"))
+    if not files:
+        return None
+
+    def ts(p: Path):
+        m = _TS_RE.search(p.name)
+        return m.group(0) if m else p.name
+
+    return sorted(files, key=ts)[-1]
+
+
+def find_session_json(session: str) -> Optional[Path]:
+    """在 <output_dir>/origin/*/<session>/ 下查找该 session 的最新原始轨迹 json。
+    assistant 目录名每次下载会变(取决于 obs 路径末段), 所以用通配符搜, 不写死目录名。"""
+    if "/" in session or ".." in session:
+        return None
+    for candidate in origin_dir().glob(f"*/{session}"):
+        if candidate.is_dir():
+            found = _latest_json(candidate)
+            if found:
+                return found
+    return None
+
+
+_MAX_MSG_CHARS = 6000
+
+
+def _extract_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            b.get("text", "") for b in content if isinstance(b, dict) and "text" in b
+        )
+    return ""
+
+
+def _simplify_message(msg: dict) -> dict:
+    """把原始消息裁剪成前端渲染需要的最小字段, 并截断超长内容, 避免一次性把整份轨迹(可达 700KB+)全丢给前端。"""
+    role = msg.get("role")
+    text = _extract_text(msg.get("content"))
+    truncated = False
+    if len(text) > _MAX_MSG_CHARS:
+        text = text[:_MAX_MSG_CHARS]
+        truncated = True
+
+    out = {"role": role, "content": text, "truncated": truncated}
+
+    reasoning = msg.get("reasoning_content")
+    if reasoning:
+        if len(reasoning) > _MAX_MSG_CHARS:
+            reasoning = reasoning[:_MAX_MSG_CHARS]
+            out["reasoning_truncated"] = True
+        out["reasoning_content"] = reasoning
+
+    tool_calls = msg.get("tool_calls")
+    if tool_calls:
+        out["tool_calls"] = [
+            {
+                "name": tc.get("function", {}).get("name"),
+                "arguments": tc.get("function", {}).get("arguments"),
+            }
+            for tc in tool_calls
+            if isinstance(tc, dict)
+        ]
+
+    if msg.get("tool_call_id"):
+        out["tool_call_id"] = msg["tool_call_id"]
+
+    return out
 
 
 def _append_log_line(line: str):
@@ -201,6 +283,27 @@ def api_sessions(
         "page": page,
         "page_size": page_size,
         "total_pages": max(1, (total + page_size - 1) // page_size),
+    }
+
+
+@app.get("/api/session-detail/{session}")
+def api_session_detail(session: str):
+    """按需拉取单个 session 的原始轨迹(裁剪后), 供前端点开会话详情时懒加载, 避免一次性把全部轨迹(单条最大 700KB+)传给前端。"""
+    json_path = find_session_json(session)
+    if not json_path:
+        return JSONResponse({"found": False, "message": "未找到该会话的原始轨迹文件"}, status_code=404)
+
+    with open(json_path, encoding="utf-8") as f:
+        data = json.load(f)
+
+    messages = data.get("messages", [])
+    return {
+        "found": True,
+        "session": session,
+        "source_file": str(json_path),
+        "model": data.get("model"),
+        "message_count": len(messages),
+        "messages": [_simplify_message(m) for m in messages],
     }
 
 

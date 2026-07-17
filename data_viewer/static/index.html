@@ -44,24 +44,6 @@ body{
 }
 .hdr-right{display:flex;align-items:center;gap:10px}
 .content{max-width:1400px;margin:0 auto;padding:24px}
-.cards-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-bottom:20px}
-.scard{
-  --glow:var(--neon-cyan);
-  background:linear-gradient(160deg,var(--bg-2),var(--bg-1));
-  border:1px solid var(--border);border-radius:10px;padding:18px 20px;
-  box-shadow:inset 0 1px 0 rgba(255,255,255,.03);
-  transition:box-shadow .25s,border-color .25s,transform .25s;position:relative;overflow:hidden;
-}
-.scard::before{
-  content:'';position:absolute;inset:0;border-radius:10px;padding:1px;pointer-events:none;
-  background:linear-gradient(160deg,var(--glow),transparent 60%);opacity:.35;
-  -webkit-mask:linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
-  -webkit-mask-composite:xor;mask-composite:exclude;
-}
-.scard:hover{border-color:var(--glow);box-shadow:0 0 22px -4px var(--glow),inset 0 1px 0 rgba(255,255,255,.05);transform:translateY(-1px)}
-.scard-label{font-size:11px;color:var(--text-1);margin-bottom:8px;font-weight:600;letter-spacing:.5px;text-transform:uppercase}
-.scard-val{font-size:32px;font-weight:800;line-height:1;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;text-shadow:0 0 18px currentColor}
-.scard-sub{font-size:11px;color:var(--text-2);margin-top:6px}
 .panel{
   background:linear-gradient(160deg,var(--bg-2),var(--bg-1));
   border:1px solid var(--border);border-radius:10px;padding:20px;margin-bottom:20px;
@@ -73,7 +55,7 @@ body{
 }
 .panel-title::before{content:'';width:3px;height:14px;background:linear-gradient(var(--neon-cyan),var(--neon-purple));border-radius:2px;display:inline-block}
 .funnel-row{display:flex;align-items:center;gap:12px;margin-bottom:10px}
-.funnel-lbl{width:150px;font-size:12px;color:var(--text-1);text-align:right;flex-shrink:0}
+.funnel-lbl{width:90px;font-size:12px;color:var(--text-1);text-align:right;flex-shrink:0;cursor:help;border-bottom:1px dashed var(--text-2)}
 .funnel-bar{flex:1;height:26px;background:var(--bg-0);border:1px solid var(--border);border-radius:5px;overflow:hidden}
 .funnel-fill{
   height:100%;border-radius:5px;display:flex;align-items:center;padding-left:8px;font-size:11px;
@@ -104,6 +86,35 @@ body{
   font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;color:var(--text-1);
   max-height:220px;overflow:auto;background:var(--bg-0);border:1px solid var(--border);
   padding:8px;border-radius:4px;white-space:pre-wrap;word-break:break-all;
+}
+.traj-section{margin-top:16px}
+.traj-loading{display:flex;align-items:center;gap:8px;justify-content:center;padding:16px;color:var(--text-1);font-size:13px}
+.traj-spinner{
+  width:14px;height:14px;border-radius:50%;border:2px solid var(--border);border-top-color:var(--neon-cyan);
+  display:inline-block;animation:spin .8s linear infinite;
+}
+@keyframes spin{to{transform:rotate(360deg)}}
+.traj-viewer{margin-top:10px;max-height:420px;overflow:auto;border:1px solid var(--border);border-radius:6px;background:var(--bg-0)}
+.traj-meta{font-size:11px;color:var(--text-2);padding:8px 12px;border-bottom:1px solid var(--border);position:sticky;top:0;background:var(--bg-0)}
+.traj-msg{padding:10px 12px;border-bottom:1px solid rgba(0,217,255,.06);display:flex;gap:10px}
+.traj-msg:last-child{border-bottom:none}
+.traj-msg-role{
+  flex-shrink:0;width:64px;font-size:10px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;
+  padding-top:2px;font-family:ui-monospace,monospace;
+}
+.role-system .traj-msg-role{color:var(--text-2)}
+.role-user .traj-msg-role{color:var(--neon-cyan)}
+.role-assistant .traj-msg-role{color:var(--neon-purple)}
+.role-tool .traj-msg-role{color:var(--neon-green)}
+.traj-msg-body{flex:1;min-width:0;font-size:12px;line-height:1.6}
+.traj-reasoning{color:var(--text-2);font-style:italic;white-space:pre-wrap;word-break:break-word;margin-bottom:6px}
+.traj-content{color:var(--text-0);white-space:pre-wrap;word-break:break-word}
+.traj-cut{color:var(--neon-amber);font-size:11px}
+.traj-toolcalls{margin-top:6px;display:flex;flex-direction:column;gap:4px}
+.traj-toolcall{
+  font-family:ui-monospace,monospace;font-size:11px;color:var(--neon-green);
+  background:rgba(0,255,168,.06);border:1px solid rgba(0,255,168,.2);border-radius:4px;padding:4px 8px;
+  word-break:break-all;
 }
 </style>
 </head>
@@ -151,20 +162,13 @@ body{
     <pre style="font-size:11px;white-space:pre-wrap;max-height:100px;overflow:auto;margin-top:4px">{{ jobStatus.last_error }}</pre>
   </el-alert>
 
-  <!-- Stats Cards -->
-  <div v-if="stats.available" class="cards-row">
-    <div class="scard" v-for="c in statCards" :key="c.key">
-      <div class="scard-label">{{ c.label }}</div>
-      <div class="scard-val" :style="{color:c.color}">{{ stats[c.key] ?? '—' }}</div>
-      <div v-if="c.sub" class="scard-sub">{{ c.sub }}</div>
-    </div>
-  </div>
-
-  <!-- Funnel -->
+  <!-- 数据总览 -->
   <div v-if="stats.available" class="panel">
-    <div class="panel-title">筛选漏斗</div>
+    <div class="panel-title">数据总览</div>
     <div v-for="f in funnelRows" :key="f.label" class="funnel-row">
-      <div class="funnel-lbl">{{ f.label }}</div>
+      <el-tooltip :content="f.tip" placement="top">
+        <div class="funnel-lbl">{{ f.label }}</div>
+      </el-tooltip>
       <div class="funnel-bar">
         <div class="funnel-fill" :style="{width:f.pct+'%',background:f.color}">
           {{ f.pct > 9 ? f.pct + '%' : '' }}
@@ -228,7 +232,7 @@ body{
 </div><!-- /content -->
 
 <!-- Session Detail Dialog -->
-<el-dialog v-model="detailVisible" title="会话详情" width="540px" destroy-on-close>
+<el-dialog v-model="detailVisible" title="会话详情" width="720px" destroy-on-close>
   <template v-if="selectedSession">
     <el-descriptions :column="1" border size="small">
       <el-descriptions-item label="Session ID">
@@ -251,6 +255,38 @@ body{
         <span style="font-family:ui-monospace,monospace;font-size:12px;color:var(--text-1)">{{ selectedSession.eval_qc || '—' }}</span>
       </el-descriptions-item>
     </el-descriptions>
+
+    <div class="traj-section">
+      <el-button v-if="!trajLoaded && !trajLoading" size="small" @click="loadTrajectory" style="width:100%">
+        查看具体轨迹
+      </el-button>
+      <div v-if="trajLoading" class="traj-loading">
+        <span class="traj-spinner"></span> 正在加载轨迹...
+      </div>
+      <el-alert v-if="trajError" :title="trajError" type="error" show-icon :closable="false" style="margin-top:10px"></el-alert>
+
+      <div v-if="trajLoaded" class="traj-viewer">
+        <div class="traj-meta">
+          共 {{ trajData.message_count }} 条消息{{ trajData.model ? ' · 模型 ' + trajData.model : '' }}
+        </div>
+        <div class="traj-msg" v-for="(m, i) in trajData.messages" :key="i" :class="'role-' + m.role">
+          <div class="traj-msg-role">{{ roleLabel(m.role) }}</div>
+          <div class="traj-msg-body">
+            <div v-if="m.reasoning_content" class="traj-reasoning">
+              {{ m.reasoning_content }}<span v-if="m.reasoning_truncated" class="traj-cut"> …(已截断)</span>
+            </div>
+            <div v-if="m.content" class="traj-content">
+              {{ m.content }}<span v-if="m.truncated" class="traj-cut"> …(已截断)</span>
+            </div>
+            <div v-if="m.tool_calls && m.tool_calls.length" class="traj-toolcalls">
+              <div v-for="(tc, j) in m.tool_calls" :key="j" class="traj-toolcall">
+                🔧 {{ tc.name }}<span v-if="tc.arguments">({{ tc.arguments }})</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
   </template>
 </el-dialog>
 
@@ -273,6 +309,10 @@ createApp({
       jobStatus: {},
       selectedSession: null,
       detailVisible: false,
+      trajLoading: false,
+      trajLoaded: false,
+      trajError: '',
+      trajData: null,
       autoRefreshMin: 0,
       _autoTimer: null,
       _pollTimer: null,
@@ -291,25 +331,20 @@ createApp({
       const started = new Date(this.jobStatus.started_at).getTime()
       return Math.max(0, Math.round((this.nowTick - started) / 1000))
     },
-    statCards() {
-      return [
-        { key: 'filtered_count',    label: 'L0  筛选后轨迹',     color: '#00d9ff', sub: '通过错误备注筛选' },
-        { key: 'with_eval_count',   label: 'L1  有评测结果',     color: '#00ffa8', sub: '含 completion=null 的裁决' },
-        { key: 'completion_ge_0.5', label: 'L2  Completion ≥ 0.5', color: '#ffc23c', sub: 'completion 为数值者' },
-        { key: 'completion_eq_1',   label: 'L3  Completion = 1', color: '#ff3d6e', sub: '最高质量' },
-        { key: 'dropped_count',     label: '丢弃（含错误备注）',  color: '#5b6a8f', sub: '' },
-        { key: 'pangu_complete',    label: 'Pangu 完整条数',     color: '#8b6bff', sub: 'pangu_filtered.jsonl' },
-      ]
-    },
     funnelRows() {
       const total = (this.stats.filtered_count || 0) + (this.stats.dropped_count || 0)
       const p = (n) => total ? Math.round((n || 0) / total * 100) : 0
       return [
-        { label: '总轨迹数',           count: total,                              pct: 100, color: '#5b6a8f' },
-        { label: 'L0 筛选后',          count: this.stats.filtered_count || 0,     pct: p(this.stats.filtered_count),    color: '#00d9ff' },
-        { label: 'L1 有评测结果',      count: this.stats.with_eval_count || 0,    pct: p(this.stats.with_eval_count),   color: '#00ffa8' },
-        { label: 'L2 Completion ≥ 0.5',count: this.stats['completion_ge_0.5']||0, pct: p(this.stats['completion_ge_0.5']),color: '#ffc23c' },
-        { label: 'L3 Completion = 1',  count: this.stats.completion_eq_1 || 0,    pct: p(this.stats.completion_eq_1),   color: '#ff3d6e' },
+        { label: '总轨迹数', count: total, pct: 100, color: '#5b6a8f',
+          tip: `下载到本地的原始轨迹总数(筛选后 ${this.stats.filtered_count || 0} + 丢弃 ${this.stats.dropped_count || 0})` },
+        { label: 'L0', count: this.stats.filtered_count || 0, pct: p(this.stats.filtered_count), color: '#00d9ff',
+          tip: '筛选后轨迹数: 错误备注为空或仅含"200空响应"的会话，即通过基础质量筛查的轨迹' },
+        { label: 'L1', count: this.stats.with_eval_count || 0, pct: p(this.stats.with_eval_count), color: '#00ffa8',
+          tip: '有 evaluator 首轮评测结果的轨迹数(含 completion=null 的裁决)' },
+        { label: 'L2', count: this.stats['completion_ge_0.5'] || 0, pct: p(this.stats['completion_ge_0.5']), color: '#ffc23c',
+          tip: 'evaluator 给出的 completion 分数 ≥ 0.5 的轨迹数(仅统计 completion 为数值的情况)' },
+        { label: 'L3', count: this.stats.completion_eq_1 || 0, pct: p(this.stats.completion_eq_1), color: '#ff3d6e',
+          tip: 'evaluator 给出的 completion 分数 = 1 的轨迹数，即完全达成任务的最高质量轨迹' },
       ]
     },
   },
@@ -383,7 +418,35 @@ createApp({
       }
     },
     onFilterChange() { this.currentPage = 1; this.loadSessions() },
-    openDetail(row) { this.selectedSession = row; this.detailVisible = true },
+    openDetail(row) {
+      this.selectedSession = row
+      this.detailVisible = true
+      this.trajLoading = false
+      this.trajLoaded = false
+      this.trajError = ''
+      this.trajData = null
+    },
+    async loadTrajectory() {
+      if (!this.selectedSession) return
+      this.trajLoading = true
+      this.trajError = ''
+      try {
+        const r = await axios.get(`/api/session-detail/${encodeURIComponent(this.selectedSession.session)}`)
+        if (r.data.found) {
+          this.trajData = r.data
+          this.trajLoaded = true
+        } else {
+          this.trajError = r.data.message || '未找到轨迹数据'
+        }
+      } catch (e) {
+        this.trajError = e.response?.data?.message || '加载轨迹失败，请检查后端服务'
+      } finally {
+        this.trajLoading = false
+      }
+    },
+    roleLabel(role) {
+      return { system: 'SYSTEM', user: 'USER', assistant: 'ASSISTANT', tool: 'TOOL' }[role] || (role || '').toUpperCase()
+    },
     completionColor(v) {
       if (v === null || v === undefined) return '#5b6a8f'
       if (v >= 1) return '#ff3d6e'
