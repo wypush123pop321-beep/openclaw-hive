@@ -28,3 +28,7 @@ platform/settings/user_proxy_model.json
 # 通用
 .env
 *.log
+
+# ===== data_viewer =====
+# 流水线下载/处理产物（含原始轨迹, 体积很大, 各环境自行拉取生成）
+data_viewer/pipeline_output/
