@@ -89,6 +89,31 @@ def update_task(task_id: str, **fields):
     save_tasks(tasks)
 
 
+def delete_task_data(output_dir: str):
+    """删除任务对应的数据文件。
+
+    legacy 任务的 output_dir 就是 pipeline_output 根目录本身(其他新任务的数据都存在
+    pipeline_output/tasks/<id>/ 下面), 如果对它整个 rmtree 会把 tasks/ 目录下所有其他
+    任务的数据一并删掉, 所以这种情况只删该任务自己名下的几个产物文件/目录, 不动 tasks/ 子目录。
+    """
+    import shutil
+
+    cfg = load_config()
+    base_dir = Path(cfg["output_base_dir"]).resolve()
+    out_dir = Path(output_dir).resolve()
+
+    if out_dir == base_dir:
+        for name in ("filter_stats.json", "filtered_sessions.txt", "pangu_filtered.jsonl",
+                     "pangu_filtered_truncated.jsonl", "pangu_filtered_fold.jsonl", "origin"):
+            target = out_dir / name
+            if target.is_dir():
+                shutil.rmtree(target, ignore_errors=True)
+            elif target.exists():
+                target.unlink()
+    elif out_dir.exists():
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
 def migrate_legacy_task_if_needed():
     """首次启动时, 若已存在旧版单数据源跑出来的 pipeline_output/filter_stats.json,
     把它包装成一个"历史数据"任务, 不移动/不重跑, 只是纳入任务列表。"""
@@ -404,6 +429,37 @@ def api_trigger_task(task_id: str):
             return {"success": False, "message": "已有任务正在采集中，请稍候"}
     threading.Thread(target=run_pipeline, args=(task_id,), daemon=True).start()
     return {"success": True, "message": "已开始采集"}
+
+
+@app.patch("/api/tasks/{task_id}")
+def api_rename_task(task_id: str, body: dict):
+    task = find_task(task_id)
+    if not task:
+        return JSONResponse({"success": False, "message": "任务不存在"}, status_code=404)
+    name = (body.get("name") or "").strip()
+    if not name:
+        return JSONResponse({"success": False, "message": "任务名称不能为空"}, status_code=400)
+    update_task(task_id, name=name)
+    return {"success": True, "task": find_task(task_id)}
+
+
+@app.delete("/api/tasks/{task_id}")
+def api_delete_task(task_id: str):
+    task = find_task(task_id)
+    if not task:
+        return JSONResponse({"success": False, "message": "任务不存在"}, status_code=404)
+
+    with _job_lock:
+        if _job_state["running"] and _job_state["task_id"] == task_id:
+            return JSONResponse(
+                {"success": False, "message": "该任务正在采集中，无法删除，请等待采集结束"},
+                status_code=409,
+            )
+
+    delete_task_data(task["output_dir"])
+    tasks = [t for t in load_tasks() if t["id"] != task_id]
+    save_tasks(tasks)
+    return {"success": True, "message": "任务已删除"}
 
 
 @app.get("/api/stats")

@@ -186,6 +186,11 @@ body{
             <span class="task-name-link" @click="enterTask(row)">{{ row.name }}</span>
           </template>
         </el-table-column>
+        <el-table-column label="创建时间" width="160" show-overflow-tooltip>
+          <template #default="{row}">
+            <span style="font-size:11px;color:var(--text-2)">{{ formatTime(row.created_at) }}</span>
+          </template>
+        </el-table-column>
         <el-table-column label="Assistant OBS" min-width="200" show-overflow-tooltip>
           <template #default="{row}"><span class="task-obs">{{ row.assistant_obs || '—' }}</span></template>
         </el-table-column>
@@ -208,9 +213,15 @@ body{
             <el-tag v-else type="info" size="small">未运行</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="100" align="center">
+        <el-table-column label="操作" width="180" align="center">
           <template #default="{row}">
             <el-button size="small" text :disabled="jobStatus.running" @click="retriggerTask(row)">重新采集</el-button>
+            <el-button size="small" text @click="openRenameForm(row)">重命名</el-button>
+            <el-popconfirm title="确定删除该任务及其采集到的所有数据吗？此操作不可恢复。" confirm-button-text="删除" cancel-button-text="取消" @confirm="deleteTask(row)">
+              <template #reference>
+                <el-button size="small" text type="danger" :disabled="jobStatus.running && jobStatus.task_id === row.id">删除</el-button>
+              </template>
+            </el-popconfirm>
           </template>
         </el-table-column>
       </el-table>
@@ -304,6 +315,19 @@ body{
   </template>
 </el-dialog>
 
+<!-- 重命名任务 Dialog -->
+<el-dialog v-model="renameFormVisible" title="重命名任务" width="440px" destroy-on-close>
+  <el-form :model="renameForm" label-position="top" @submit.prevent>
+    <el-form-item label="任务名称" required>
+      <el-input v-model="renameForm.name" @keyup.enter="submitRenameForm"></el-input>
+    </el-form-item>
+  </el-form>
+  <template #footer>
+    <el-button @click="renameFormVisible = false">取消</el-button>
+    <el-button type="primary" :loading="renameFormSubmitting" @click="submitRenameForm">保存</el-button>
+  </template>
+</el-dialog>
+
 <!-- Session Detail Dialog -->
 <el-dialog v-model="detailVisible" title="会话详情" width="720px" destroy-on-close>
   <template v-if="selectedSession">
@@ -379,6 +403,10 @@ createApp({
       taskFormVisible: false,
       taskFormSubmitting: false,
       taskForm: { name: '', assistant_obs: '', evaluator_obs: '' },
+
+      renameFormVisible: false,
+      renameFormSubmitting: false,
+      renameForm: { taskId: '', name: '' },
 
       stats: { available: false },
       sessions: [],
@@ -508,6 +536,50 @@ createApp({
         }
       } catch (e) {
         ElementPlus.ElMessage.error('触发失败，请检查后端服务')
+      }
+    },
+
+    formatTime(iso) {
+      if (!iso) return '—'
+      return new Date(iso).toLocaleString('zh-CN')
+    },
+    openRenameForm(task) {
+      this.renameForm = { taskId: task.id, name: task.name }
+      this.renameFormVisible = true
+    },
+    async submitRenameForm() {
+      const name = this.renameForm.name.trim()
+      if (!name) {
+        ElementPlus.ElMessage.warning('任务名称不能为空')
+        return
+      }
+      this.renameFormSubmitting = true
+      try {
+        const r = await axios.patch(`/api/tasks/${this.renameForm.taskId}`, { name })
+        if (r.data.success) {
+          ElementPlus.ElMessage.success('已重命名')
+          this.renameFormVisible = false
+          await this.loadTasks()
+        } else {
+          ElementPlus.ElMessage.error(r.data.message || '重命名失败')
+        }
+      } catch (e) {
+        ElementPlus.ElMessage.error(e.response?.data?.message || '重命名失败，请检查后端服务')
+      } finally {
+        this.renameFormSubmitting = false
+      }
+    },
+    async deleteTask(task) {
+      try {
+        const r = await axios.delete(`/api/tasks/${task.id}`)
+        if (r.data.success) {
+          ElementPlus.ElMessage.success('任务已删除')
+          await Promise.all([this.loadTasks(), this.loadStats()])
+        } else {
+          ElementPlus.ElMessage.error(r.data.message || '删除失败')
+        }
+      } catch (e) {
+        ElementPlus.ElMessage.error(e.response?.data?.message || '删除失败，请检查后端服务')
       }
     },
 
