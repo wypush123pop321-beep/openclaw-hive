@@ -526,28 +526,42 @@ def api_task_sessions(
     }
 
 
-@app.get("/api/tasks/{task_id}/session-detail/{session}")
-def api_task_session_detail(task_id: str, session: str):
-    task = find_task(task_id)
-    if not task:
-        return JSONResponse({"found": False, "message": "任务不存在"}, status_code=404)
-
-    json_path = find_session_json(session, task["output_dir"])
+def _load_simplified_trajectory(session: str, output_dir: str) -> Optional[dict]:
+    """按 session(目录名) 定位原始轨迹 json 并裁剪为前端渲染用的结构。
+    assistant/evaluator 两侧轨迹目录结构一致, 都是 <output_dir>/origin/*/<session>/*.json,
+    所以同一套查找+裁剪逻辑对两者都适用。"""
+    json_path = find_session_json(session, output_dir)
     if not json_path:
-        return JSONResponse({"found": False, "message": "未找到该会话的原始轨迹文件"}, status_code=404)
-
+        return None
     with open(json_path, encoding="utf-8") as f:
         data = json.load(f)
-
     messages = data.get("messages", [])
     return {
-        "found": True,
         "session": session,
         "source_file": str(json_path),
         "model": data.get("model"),
         "message_count": len(messages),
         "messages": [_simplify_message(m) for m in messages],
     }
+
+
+@app.get("/api/tasks/{task_id}/session-detail/{session}")
+def api_task_session_detail(task_id: str, session: str, eval_qc: Optional[str] = None):
+    task = find_task(task_id)
+    if not task:
+        return JSONResponse({"found": False, "message": "任务不存在"}, status_code=404)
+
+    assistant = _load_simplified_trajectory(session, task["output_dir"])
+    if not assistant:
+        return JSONResponse({"found": False, "message": "未找到该会话的原始轨迹文件"}, status_code=404)
+
+    result = {"found": True, **assistant}
+
+    if eval_qc:
+        evaluator = _load_simplified_trajectory(eval_qc, task["output_dir"])
+        result["evaluator"] = evaluator  # 找不到时为 None, 前端据此隐藏 evaluator 标签页
+
+    return result
 
 
 @app.get("/api/job-status")

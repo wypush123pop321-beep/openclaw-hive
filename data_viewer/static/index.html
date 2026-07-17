@@ -116,6 +116,14 @@ body{
   background:rgba(0,255,168,.06);border:1px solid rgba(0,255,168,.2);border-radius:4px;padding:4px 8px;
   word-break:break-all;
 }
+.traj-tabs{display:flex;gap:6px;margin-top:12px;border-bottom:1px solid var(--border)}
+.traj-tab{
+  padding:6px 12px;font-size:12px;color:var(--text-1);cursor:pointer;border-bottom:2px solid transparent;
+  transition:color .15s,border-color .15s;
+}
+.traj-tab:hover{color:var(--text-0)}
+.traj-tab.active{color:var(--neon-cyan);border-bottom-color:var(--neon-cyan);font-weight:600}
+.traj-tab-disabled{color:var(--text-2);cursor:default;font-size:11px}
 .task-name-link{color:var(--neon-cyan);cursor:pointer;font-weight:600}
 .task-name-link:hover{text-decoration:underline}
 .task-obs{font-family:ui-monospace,monospace;font-size:11px;color:var(--text-2)}
@@ -362,11 +370,17 @@ body{
       </div>
       <el-alert v-if="trajError" :title="trajError" type="error" show-icon :closable="false" style="margin-top:10px"></el-alert>
 
-      <div v-if="trajLoaded" class="traj-viewer">
+      <div v-if="trajLoaded" class="traj-tabs">
+        <div class="traj-tab" :class="{active: trajTab==='assistant'}" @click="trajTab='assistant'">Assistant 轨迹</div>
+        <div v-if="trajData.evaluator" class="traj-tab" :class="{active: trajTab==='evaluator'}" @click="trajTab='evaluator'">Evaluator 轨迹</div>
+        <div v-else-if="selectedSession.eval_qc" class="traj-tab traj-tab-disabled">Evaluator 轨迹（未找到）</div>
+      </div>
+
+      <div v-if="trajLoaded && activeTrajData" class="traj-viewer">
         <div class="traj-meta">
-          共 {{ trajData.message_count }} 条消息{{ trajData.model ? ' · 模型 ' + trajData.model : '' }}
+          共 {{ activeTrajData.message_count }} 条消息{{ activeTrajData.model ? ' · 模型 ' + activeTrajData.model : '' }}
         </div>
-        <div class="traj-msg" v-for="(m, i) in trajData.messages" :key="i" :class="'role-' + m.role">
+        <div class="traj-msg" v-for="(m, i) in activeTrajData.messages" :key="i" :class="'role-' + m.role">
           <div class="traj-msg-role">{{ roleLabel(m.role) }}</div>
           <div class="traj-msg-body">
             <div v-if="m.reasoning_content" class="traj-reasoning">
@@ -422,6 +436,7 @@ createApp({
       trajLoaded: false,
       trajError: '',
       trajData: null,
+      trajTab: 'assistant',
       _pollTimer: null,
       _tickTimer: null,
       nowTick: Date.now(),
@@ -441,6 +456,11 @@ createApp({
       if (!this.jobStatus.running || !this.jobStatus.started_at) return 0
       const started = new Date(this.jobStatus.started_at).getTime()
       return Math.max(0, Math.round((this.nowTick - started) / 1000))
+    },
+    activeTrajData() {
+      if (!this.trajData) return null
+      if (this.trajTab === 'evaluator') return this.trajData.evaluator || null
+      return this.trajData
     },
     funnelRows() {
       const total = (this.stats.filtered_count || 0) + (this.stats.dropped_count || 0)
@@ -631,13 +651,18 @@ createApp({
       this.trajLoaded = false
       this.trajError = ''
       this.trajData = null
+      this.trajTab = 'assistant'
     },
     async loadTrajectory() {
       if (!this.selectedSession || !this.activeTaskId) return
       this.trajLoading = true
       this.trajError = ''
       try {
-        const r = await axios.get(`/api/tasks/${this.activeTaskId}/session-detail/${encodeURIComponent(this.selectedSession.session)}`)
+        const params = {}
+        if (this.selectedSession.has_eval && this.selectedSession.eval_qc) {
+          params.eval_qc = this.selectedSession.eval_qc
+        }
+        const r = await axios.get(`/api/tasks/${this.activeTaskId}/session-detail/${encodeURIComponent(this.selectedSession.session)}`, { params })
         if (r.data.found) {
           this.trajData = r.data
           this.trajLoaded = true
