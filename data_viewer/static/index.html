@@ -55,7 +55,7 @@ body{
 }
 .panel-title::before{content:'';width:3px;height:14px;background:linear-gradient(var(--neon-cyan),var(--neon-purple));border-radius:2px;display:inline-block}
 .funnel-row{display:flex;align-items:center;gap:12px;margin-bottom:10px}
-.funnel-lbl{width:90px;font-size:12px;color:var(--text-1);text-align:right;flex-shrink:0;cursor:help;border-bottom:1px dashed var(--text-2)}
+.funnel-lbl{width:60px;font-size:12px;color:var(--text-1);text-align:right;flex-shrink:0;cursor:help;border-bottom:1px dashed var(--text-2);white-space:nowrap}
 .funnel-bar{flex:1;height:26px;background:var(--bg-0);border:1px solid var(--border);border-radius:5px;overflow:hidden}
 .funnel-fill{
   height:100%;border-radius:5px;display:flex;align-items:center;padding-left:8px;font-size:11px;
@@ -63,6 +63,7 @@ body{
   box-shadow:0 0 12px -2px currentColor;
 }
 .funnel-n{width:55px;text-align:right;font-weight:700;font-size:13px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;text-shadow:0 0 14px currentColor}
+.funnel-pct{width:44px;text-align:right;font-size:11px;color:var(--text-1);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 .tbl-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:8px}
 .tbl-title{font-size:13px;font-weight:700;color:var(--text-0);display:flex;align-items:center;gap:6px;letter-spacing:.5px;text-transform:uppercase}
 .tbl-title::before{content:'';width:3px;height:14px;background:linear-gradient(var(--neon-cyan),var(--neon-purple));border-radius:2px;display:inline-block}
@@ -133,6 +134,18 @@ body{
 .task-info-panel{display:flex;flex-direction:column;gap:4px;margin-bottom:16px}
 .task-info-name{font-size:16px;font-weight:700;color:var(--text-0)}
 .task-info-obs{font-size:11px;color:var(--text-2);font-family:ui-monospace,monospace;word-break:break-all}
+.rubric-panel{margin-top:12px;padding:12px;border:1px solid var(--border);border-radius:6px;background:var(--bg-1)}
+.rubric-summary{display:flex;align-items:center;gap:14px;margin-bottom:8px;font-size:13px}
+.rubric-completion{font-weight:700;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.rubric-inclination{color:var(--text-1);font-size:12px}
+.rubric-reason{font-size:12px;color:var(--text-1);line-height:1.6;margin-bottom:10px;padding-bottom:10px;border-bottom:1px solid var(--border)}
+.rubric-list{display:flex;flex-direction:column;gap:8px;max-height:260px;overflow:auto}
+.rubric-item{padding:8px 10px;border-radius:5px;background:rgba(0,255,168,.05);border:1px solid rgba(0,255,168,.18)}
+.rubric-item.rubric-fail{background:rgba(255,61,110,.06);border-color:rgba(255,61,110,.25)}
+.rubric-item-hdr{display:flex;align-items:center;gap:8px;margin-bottom:4px}
+.rubric-criterion{font-size:12px;color:var(--text-0);line-height:1.5}
+.rubric-evidence{font-size:11px;color:var(--text-1);line-height:1.5;margin-top:4px}
+.ssh-fields{display:flex;gap:8px;flex-wrap:wrap}
 </style>
 </head>
 <body>
@@ -167,7 +180,7 @@ body{
   <!-- ============ 总览视图 ============ -->
   <template v-if="view === 'overview'">
     <el-alert v-if="!stats.available && !jobStatus.running" title="尚无数据" type="info" show-icon :closable="false"
-      description="点击右上角「登记采集任务」，填写任务名称与两个 OBS 地址后即可开始采集。" style="margin-bottom:18px"></el-alert>
+      description="点击右上角「登记采集任务」，选择登记方式（session_analysis 双 OBS / 原始 workspace 单 OBS）填写后即可开始采集。" style="margin-bottom:18px"></el-alert>
 
     <div v-if="stats.available" class="panel">
       <div class="panel-title">数据总览</div>
@@ -176,10 +189,9 @@ body{
           <div class="funnel-lbl">{{ f.label }}</div>
         </el-tooltip>
         <div class="funnel-bar">
-          <div class="funnel-fill" :style="{width:f.pct+'%',background:f.color}">
-            {{ f.pct > 9 ? f.pct + '%' : '' }}
-          </div>
+          <div class="funnel-fill" :style="{width:f.pct+'%',background:f.color}"></div>
         </div>
+        <div class="funnel-pct" :style="{color:f.color}">{{ f.pct }}%</div>
         <div class="funnel-n" :style="{color:f.color}">{{ f.count }}</div>
       </div>
     </div>
@@ -189,9 +201,12 @@ body{
         <div class="tbl-title">采集任务 <el-tag size="small" type="info">共 {{ tasks.length }} 个</el-tag></div>
       </div>
       <el-table :data="tasks" size="small" border v-loading="tasksLoading">
-        <el-table-column label="任务名称" min-width="160" show-overflow-tooltip>
+        <el-table-column label="任务名称" min-width="180" show-overflow-tooltip>
           <template #default="{row}">
             <span class="task-name-link" @click="enterTask(row)">{{ row.name }}</span>
+            <el-tag size="small" :type="(row.source_type === 'workspace') ? 'warning' : 'info'" style="margin-left:6px">
+              {{ (row.source_type === 'workspace') ? 'workspace' : 'session' }}
+            </el-tag>
           </template>
         </el-table-column>
         <el-table-column label="创建时间" width="160" show-overflow-tooltip>
@@ -199,16 +214,18 @@ body{
             <span style="font-size:11px;color:var(--text-2)">{{ formatTime(row.created_at) }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="Assistant OBS" min-width="200" show-overflow-tooltip>
-          <template #default="{row}"><span class="task-obs">{{ row.assistant_obs || '—' }}</span></template>
+        <el-table-column label="数据来源" min-width="240" show-overflow-tooltip>
+          <template #default="{row}">
+            <span v-if="row.source_type === 'workspace'" class="task-obs">workspace: {{ row.workspace_obs || '—' }}</span>
+            <span v-else class="task-obs">
+              assistant: {{ row.assistant_obs || '—' }}<br>eval: {{ row.evaluator_obs || '—' }}
+            </span>
+          </template>
         </el-table-column>
-        <el-table-column label="Eval OBS" min-width="200" show-overflow-tooltip>
-          <template #default="{row}"><span class="task-obs">{{ row.evaluator_obs || '—' }}</span></template>
-        </el-table-column>
-        <el-table-column label="L0/L1/L2/L3" width="150" align="center">
+        <el-table-column label="L0/L1/L1.5/L2/L3" width="180" align="center">
           <template #default="{row}">
             <span v-if="row.available" style="font-family:ui-monospace,monospace;font-size:12px">
-              {{ row.filtered_count }}/{{ row.with_eval_count }}/{{ row['completion_ge_0.5'] }}/{{ row.completion_eq_1 }}
+              {{ (row.filtered_count || 0) + (row.dropped_count || 0) }}/{{ row.filtered_count }}/{{ row.with_eval_count }}/{{ row['completion_ge_0.5'] }}/{{ row.completion_eq_1 }}
             </span>
             <span v-else style="color:var(--text-2)">—</span>
           </template>
@@ -243,8 +260,13 @@ body{
     </div>
     <div class="task-info-panel">
       <div class="task-info-name">{{ activeTask.name }}</div>
-      <div class="task-info-obs">assistant: {{ activeTask.assistant_obs || '—' }}</div>
-      <div class="task-info-obs">eval: {{ activeTask.evaluator_obs || '—' }}</div>
+      <template v-if="activeTask.source_type === 'workspace'">
+        <div class="task-info-obs">workspace: {{ activeTask.workspace_obs || '—' }}</div>
+      </template>
+      <template v-else>
+        <div class="task-info-obs">assistant: {{ activeTask.assistant_obs || '—' }}</div>
+        <div class="task-info-obs">eval: {{ activeTask.evaluator_obs || '—' }}</div>
+      </template>
     </div>
 
     <el-alert v-if="!activeTask.available && !(jobStatus.running && jobStatus.task_id === activeTaskId)" title="该任务尚无数据" type="info" show-icon :closable="false"
@@ -305,21 +327,83 @@ body{
 </div><!-- /content -->
 
 <!-- 登记采集任务 Dialog -->
-<el-dialog v-model="taskFormVisible" title="登记采集任务" width="560px" destroy-on-close>
+<el-dialog v-model="taskFormVisible" title="登记采集任务" width="600px" destroy-on-close>
   <el-form :model="taskForm" label-position="top" @submit.prevent>
     <el-form-item label="任务名称" required>
       <el-input v-model="taskForm.name" placeholder="例如: 0717-口腔科普任务批次"></el-input>
     </el-form-item>
-    <el-form-item label="Assistant 轨迹 OBS 地址" required>
-      <el-input v-model="taskForm.assistant_obs" placeholder="obs://rl-agentdata/.../ex-xxxxx/"></el-input>
+
+    <el-form-item label="登记方式" required>
+      <el-radio-group v-model="taskForm.source_type" size="small">
+        <el-radio-button value="session_analysis">session_analysis（双 OBS）</el-radio-button>
+        <el-radio-button value="workspace">原始 workspace（单 OBS）</el-radio-button>
+      </el-radio-group>
+      <div style="font-size:11px;color:var(--text-2);margin-top:6px;line-height:1.5">
+        <template v-if="taskForm.source_type === 'workspace'">
+          直接给一个 workspace 根路径（其下每个子目录是一个 task）。按需下载每个 task 的必要文件后统计，
+          口径与平台一致（L0=总轨迹, L1=可用轨迹, L1.5=有裁决, L2=completion≥0.5, L3=completion=1，completion 取首轮 turn=1）。
+        </template>
+        <template v-else>
+          分别填 assistant 与 eval 两份 session_analysis 来源（现有方式）。
+        </template>
+      </div>
     </el-form-item>
-    <el-form-item label="Eval 轨迹 OBS 地址" required>
-      <el-input v-model="taskForm.evaluator_obs" placeholder="obs://rl-agentdata/.../ex-xxxxx/"></el-input>
+
+    <!-- workspace: 单一根路径 -->
+    <el-form-item v-if="taskForm.source_type === 'workspace'" label="Workspace OBS 根路径" required>
+      <el-input v-model="taskForm.workspace_obs"
+        placeholder="obs://rl-agentdata/openclaw_trajs/<batch>/"></el-input>
     </el-form-item>
+
+    <el-form-item v-if="taskForm.source_type === 'workspace'" label="下载并发数">
+      <el-input-number v-model="taskForm.concurrency" :min="1" :max="64" :step="1" controls-position="right" style="width:130px"></el-input-number>
+      <span style="font-size:11px;color:var(--text-2);margin-left:10px">
+        默认 8。主要受网络延迟/OBS 限流约束,带宽与内存一般不是瓶颈;调高提速,过高可能触发限流(失败数上升)。建议 8–32。
+      </span>
+    </el-form-item>
+
+    <!-- session_analysis: assistant + evaluator 两份来源 -->
+    <template v-if="taskForm.source_type !== 'workspace'">
+     <template v-for="side in ['assistant', 'evaluator']" :key="side">
+      <el-form-item :label="(side === 'assistant' ? 'Assistant' : 'Eval') + ' 轨迹来源'" required>
+        <el-radio-group v-model="taskForm[side + '_mode']" size="small" style="margin-bottom:8px">
+          <el-radio-button value="obs">OBS 地址</el-radio-button>
+          <el-radio-button value="ssh">服务器路径</el-radio-button>
+        </el-radio-group>
+        <el-input v-if="taskForm[side + '_mode'] === 'obs'"
+          v-model="taskForm[side + '_obs']" placeholder="obs://rl-agentdata/.../ex-xxxxx/"></el-input>
+        <div v-else class="ssh-fields">
+          <el-input v-model="taskForm[side + '_ssh_user']" placeholder="用户名" style="width:120px"></el-input>
+          <el-input v-model="taskForm[side + '_ssh_host']" placeholder="服务器 IP" style="width:130px"></el-input>
+          <el-input v-model="taskForm[side + '_ssh_password']" type="password" show-password placeholder="密码" style="width:120px"></el-input>
+          <el-input v-model="taskForm[side + '_ssh_path']" placeholder="远程目录路径, 例如 /mnt/sdb/data/session/.../key-xxxx/" style="flex:1;min-width:200px"></el-input>
+        </div>
+      </el-form-item>
+     </template>
+    </template>
   </el-form>
   <template #footer>
     <el-button @click="taskFormVisible = false">取消</el-button>
     <el-button type="primary" :loading="taskFormSubmitting" @click="submitTaskForm">登记并开始采集</el-button>
+  </template>
+</el-dialog>
+
+<!-- 重新采集需要 SSH 密码 Dialog -->
+<el-dialog v-model="retriggerPasswordVisible" title="重新输入服务器密码" width="440px" destroy-on-close>
+  <div style="font-size:12px;color:var(--text-1);margin-bottom:12px">
+    该任务的来源包含服务器路径，密码不会被保存，重新采集前需要再次输入。
+  </div>
+  <el-form label-position="top" @submit.prevent>
+    <el-form-item v-if="retriggerPasswordTargets.includes('assistant')" label="Assistant 服务器密码" required>
+      <el-input v-model="retriggerPasswordForm.assistant" type="password" show-password></el-input>
+    </el-form-item>
+    <el-form-item v-if="retriggerPasswordTargets.includes('evaluator')" label="Eval 服务器密码" required>
+      <el-input v-model="retriggerPasswordForm.evaluator" type="password" show-password></el-input>
+    </el-form-item>
+  </el-form>
+  <template #footer>
+    <el-button @click="retriggerPasswordVisible = false">取消</el-button>
+    <el-button type="primary" @click="confirmRetriggerWithPassword">确认并重新采集</el-button>
   </template>
 </el-dialog>
 
@@ -376,6 +460,29 @@ body{
         <div v-else-if="selectedSession.eval_qc" class="traj-tab traj-tab-disabled">Evaluator 轨迹（未找到）</div>
       </div>
 
+      <div v-if="trajTab === 'evaluator' && trajLoaded && trajData.evaluator" class="rubric-panel">
+        <template v-if="trajData.evaluator.verdict">
+          <div class="rubric-summary">
+            <span class="rubric-completion" :style="{color: completionColor(trajData.evaluator.verdict.completion)}">
+              Completion: {{ trajData.evaluator.verdict.completion ?? '—' }}
+            </span>
+            <span v-if="trajData.evaluator.verdict.inclination" class="rubric-inclination">裁决倾向: {{ trajData.evaluator.verdict.inclination }}</span>
+          </div>
+          <div v-if="trajData.evaluator.verdict.reason" class="rubric-reason">{{ trajData.evaluator.verdict.reason }}</div>
+          <div v-if="trajData.evaluator.verdict.rubric_checks && trajData.evaluator.verdict.rubric_checks.length" class="rubric-list">
+            <div v-for="(rc, i) in trajData.evaluator.verdict.rubric_checks" :key="i" class="rubric-item" :class="{'rubric-fail': !rc.passed}">
+              <div class="rubric-item-hdr">
+                <el-tag :type="rc.kind === 'gate' ? 'warning' : 'info'" size="small" effect="dark">{{ rc.kind === 'gate' ? 'Gate' : 'Reward' }}</el-tag>
+                <el-tag :type="rc.passed ? 'success' : 'danger'" size="small">{{ rc.passed ? '满足 (1)' : '不满足 (0)' }}</el-tag>
+              </div>
+              <div class="rubric-criterion">{{ rc.criterion }}</div>
+              <div v-if="rc.evidence" class="rubric-evidence">理由: {{ rc.evidence }}</div>
+            </div>
+          </div>
+        </template>
+        <el-alert v-else type="info" :closable="false" show-icon title="未解析到该轮 evaluator 的逐条 rubric 裁决"></el-alert>
+      </div>
+
       <div v-if="trajLoaded && activeTrajData" class="traj-viewer">
         <div class="traj-meta">
           共 {{ activeTrajData.message_count }} 条消息{{ activeTrajData.model ? ' · 模型 ' + activeTrajData.model : '' }}
@@ -416,11 +523,25 @@ createApp({
 
       taskFormVisible: false,
       taskFormSubmitting: false,
-      taskForm: { name: '', assistant_obs: '', evaluator_obs: '' },
+      taskForm: {
+        name: '',
+        source_type: 'session_analysis',
+        workspace_obs: '',
+        concurrency: 8,
+        assistant_mode: 'obs', assistant_obs: '',
+        assistant_ssh_user: '', assistant_ssh_host: '', assistant_ssh_password: '', assistant_ssh_path: '',
+        evaluator_mode: 'obs', evaluator_obs: '',
+        evaluator_ssh_user: '', evaluator_ssh_host: '', evaluator_ssh_password: '', evaluator_ssh_path: '',
+      },
 
       renameFormVisible: false,
       renameFormSubmitting: false,
       renameForm: { taskId: '', name: '' },
+
+      retriggerPasswordVisible: false,
+      retriggerPasswordTargets: [],
+      retriggerPasswordTask: null,
+      retriggerPasswordForm: { assistant: '', evaluator: '' },
 
       stats: { available: false },
       sessions: [],
@@ -466,12 +587,12 @@ createApp({
       const total = (this.stats.filtered_count || 0) + (this.stats.dropped_count || 0)
       const p = (n) => total ? Math.round((n || 0) / total * 100) : 0
       return [
-        { label: '总轨迹数', count: total, pct: 100, color: '#5b6a8f',
-          tip: `所有已登记任务下载到本地的原始轨迹总数(筛选后 ${this.stats.filtered_count || 0} + 丢弃 ${this.stats.dropped_count || 0})` },
-        { label: 'L0', count: this.stats.filtered_count || 0, pct: p(this.stats.filtered_count), color: '#00d9ff',
-          tip: '筛选后轨迹数: 错误备注为空或仅含"200空响应"的会话，即通过基础质量筛查的轨迹' },
-        { label: 'L1', count: this.stats.with_eval_count || 0, pct: p(this.stats.with_eval_count), color: '#00ffa8',
-          tip: '有 evaluator 首轮评测结果的轨迹数(含 completion=null 的裁决)' },
+        { label: 'L0', count: total, pct: 100, color: '#5b6a8f',
+          tip: `总轨迹数: 所有已登记任务下载到本地的原始轨迹总数(筛选后 ${this.stats.filtered_count || 0} + 丢弃 ${this.stats.dropped_count || 0})` },
+        { label: 'L1', count: this.stats.filtered_count || 0, pct: p(this.stats.filtered_count), color: '#00d9ff',
+          tip: '可用/合格轨迹数: 通过基础质量筛查(session_analysis 来源=错误备注为空或仅含"200空响应"; workspace 来源=≥3次工具调用且有纯轮)' },
+        { label: 'L1.5', count: this.stats.with_eval_count || 0, pct: p(this.stats.with_eval_count), color: '#00ffa8',
+          tip: '有 evaluator 首轮评测结果的轨迹数(session_analysis 来源=含 completion=null 的裁决; workspace 来源=仅计 turn=1 数值分)' },
         { label: 'L2', count: this.stats['completion_ge_0.5'] || 0, pct: p(this.stats['completion_ge_0.5']), color: '#ffc23c',
           tip: 'evaluator 给出的 completion 分数 ≥ 0.5 的轨迹数(仅统计 completion 为数值的情况)' },
         { label: 'L3', count: this.stats.completion_eq_1 || 0, pct: p(this.stats.completion_eq_1), color: '#ff3d6e',
@@ -512,18 +633,64 @@ createApp({
     },
 
     openTaskForm() {
-      this.taskForm = { name: '', assistant_obs: '', evaluator_obs: '' }
+      this.taskForm = {
+        name: '',
+        source_type: 'session_analysis',
+        workspace_obs: '',
+        concurrency: 8,
+        assistant_mode: 'obs', assistant_obs: '',
+        assistant_ssh_user: '', assistant_ssh_host: '', assistant_ssh_password: '', assistant_ssh_path: '',
+        evaluator_mode: 'obs', evaluator_obs: '',
+        evaluator_ssh_user: '', evaluator_ssh_host: '', evaluator_ssh_password: '', evaluator_ssh_path: '',
+      }
       this.taskFormVisible = true
     },
+    // 服务器路径模式下拼成 ssh://user@host/remote/path/ 存进 *_obs 字段(不含密码),
+    // 密码单独通过 *_ssh_password 字段随这一次请求发送, 后端不会把它写进 tasks.json。
+    buildSourcePayload(side) {
+      const f = this.taskForm
+      if (f[side + '_mode'] === 'ssh') {
+        const user = f[side + '_ssh_user'].trim()
+        const host = f[side + '_ssh_host'].trim()
+        const password = f[side + '_ssh_password']
+        let path = f[side + '_ssh_path'].trim()
+        if (!user || !host || !password || !path) return null
+        if (!path.endsWith('/')) path += '/'
+        return { obs: `ssh://${user}@${host}${path}`, password }
+      }
+      const obs = f[side + '_obs'].trim()
+      if (!obs) return null
+      return { obs, password: '' }
+    },
     async submitTaskForm() {
-      const { name, assistant_obs, evaluator_obs } = this.taskForm
-      if (!name.trim() || !assistant_obs.trim() || !evaluator_obs.trim()) {
-        ElementPlus.ElMessage.warning('任务名称、Assistant/Eval OBS 地址均不能为空')
-        return
+      const name = this.taskForm.name.trim()
+      let payload
+      if (this.taskForm.source_type === 'workspace') {
+        const workspace_obs = this.taskForm.workspace_obs.trim()
+        if (!name || !workspace_obs) {
+          ElementPlus.ElMessage.warning('任务名称、Workspace OBS 根路径不能为空')
+          return
+        }
+        payload = { name, source_type: 'workspace', workspace_obs, concurrency: this.taskForm.concurrency || 8 }
+      } else {
+        const assistant = this.buildSourcePayload('assistant')
+        const evaluatorSrc = this.buildSourcePayload('evaluator')
+        if (!name || !assistant || !evaluatorSrc) {
+          ElementPlus.ElMessage.warning('任务名称、Assistant/Eval 来源(OBS 地址或服务器路径完整字段)均不能为空')
+          return
+        }
+        payload = {
+          name,
+          source_type: 'session_analysis',
+          assistant_obs: assistant.obs,
+          assistant_ssh_password: assistant.password,
+          evaluator_obs: evaluatorSrc.obs,
+          evaluator_ssh_password: evaluatorSrc.password,
+        }
       }
       this.taskFormSubmitting = true
       try {
-        const r = await axios.post('/api/tasks', this.taskForm)
+        const r = await axios.post('/api/tasks', payload)
         if (r.data.success) {
           ElementPlus.ElMessage.success(r.data.message)
           this.taskFormVisible = false
@@ -544,8 +711,34 @@ createApp({
     },
 
     async retriggerTask(task) {
+      // 来源是 ssh:// 的一侧, 密码从不持久化, 每次重新采集都要重新输入
+      const targets = ['assistant', 'evaluator'].filter(side => task[side + '_obs'].startsWith('ssh://'))
+      if (targets.length) {
+        this.retriggerPasswordTask = task
+        this.retriggerPasswordTargets = targets
+        this.retriggerPasswordForm = { assistant: '', evaluator: '' }
+        this.retriggerPasswordVisible = true
+        return
+      }
+      await this.doRetrigger(task, {})
+    },
+    async confirmRetriggerWithPassword() {
+      const missing = this.retriggerPasswordTargets.some(side => !this.retriggerPasswordForm[side].trim())
+      if (missing) {
+        ElementPlus.ElMessage.warning('请填写所有服务器密码')
+        return
+      }
+      const task = this.retriggerPasswordTask
+      const passwords = { ...this.retriggerPasswordForm }
+      this.retriggerPasswordVisible = false
+      await this.doRetrigger(task, passwords)
+    },
+    async doRetrigger(task, passwords) {
       try {
-        const r = await axios.post(`/api/tasks/${task.id}/trigger`)
+        const r = await axios.post(`/api/tasks/${task.id}/trigger`, {
+          assistant_ssh_password: passwords.assistant || '',
+          evaluator_ssh_password: passwords.evaluator || '',
+        })
         if (r.data.success) {
           ElementPlus.ElMessage.success(r.data.message)
           this.jobStatus = { ...this.jobStatus, running: true, task_id: task.id, started_at: new Date().toISOString() }
@@ -555,7 +748,7 @@ createApp({
           ElementPlus.ElMessage.warning(r.data.message)
         }
       } catch (e) {
-        ElementPlus.ElMessage.error('触发失败，请检查后端服务')
+        ElementPlus.ElMessage.error(e.response?.data?.message || '触发失败，请检查后端服务')
       }
     },
 
@@ -645,6 +838,11 @@ createApp({
 
     onFilterChange() { this.currentPage = 1; this.loadSessions() },
     openDetail(row) {
+      // workspace 来源暂不支持逐条轨迹查看（只做统计）
+      if (this.activeTask && this.activeTask.source_type === 'workspace') {
+        ElementPlus.ElMessage.info('workspace 任务暂只提供统计，逐条轨迹查看后续再支持')
+        return
+      }
       this.selectedSession = row
       this.detailVisible = true
       this.trajLoading = false

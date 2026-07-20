@@ -18,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 
 HERE = Path(__file__).parent
 PIPELINE_SCRIPT = HERE.parent / "traj_pipeline" / "download_and_run.py"
+WORKSPACE_PIPELINE_SCRIPT = HERE.parent / "traj_pipeline" / "download_workspace_and_run.py"
 STATIC_DIR = HERE / "static"
 CONFIG_FILE = HERE / "config.json"
 TASKS_FILE = HERE / "tasks.json"
@@ -254,12 +255,15 @@ def _append_log_line(line: str):
             _job_state["log_tail"] = _job_state["log_tail"][-_LOG_TAIL_MAX:]
 
 
-def _stream_subprocess(cmd):
+def _stream_subprocess(cmd, env=None):
     """按字符读取子进程输出, 遇 \\r/\\n 断行(与 download_and_run.py 里 obsutil 的读取方式一致),
-    这样下载进度这种用 \\r 原地刷新的行也能被实时捕获, 而不必等进程退出才能拿到全部输出。"""
+    这样下载进度这种用 \\r 原地刷新的行也能被实时捕获, 而不必等进程退出才能拿到全部输出。
+
+    env: 若不为 None, 覆盖子进程环境变量(用于传 SSH_PASSWORD_* 而不出现在 cmd 里, 避免 ps 泄露)。"""
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, encoding="utf-8", errors="replace", bufsize=1,
+        env=env,
     )
     buf = ""
     all_output = []
@@ -281,7 +285,9 @@ def _stream_subprocess(cmd):
     return proc.returncode, "\n".join(all_output)
 
 
-def run_pipeline(task_id: str):
+def run_pipeline(task_id: str, ssh_passwords: Optional[dict] = None):
+    """ssh_passwords: 可选 {"assistant": "...", "evaluator": "..."}, 仅用于来源是 ssh:// 的这一次下载,
+    只作为子进程环境变量传递, 调用结束后不再持有, 从不写入 _job_state / tasks.json / 任何文件。"""
     task = find_task(task_id)
     if not task:
         return
@@ -299,18 +305,37 @@ def run_pipeline(task_id: str):
     t0 = time.time()
     cfg = load_config()
     out_dir = task["output_dir"]
+    source_type = task.get("source_type", "session_analysis")
     try:
         os.makedirs(out_dir, exist_ok=True)
-        cmd = [
-            sys.executable,
-            "-u",
-            str(PIPELINE_SCRIPT),
-            task["assistant_obs"],
-            task["evaluator_obs"],
-            out_dir,
-            "--obsutil", cfg["obsutil_path"],
-        ]
-        exit_code, full_output = _stream_subprocess(cmd)
+        if source_type == "workspace":
+            # 单一 workspace 根路径, 按需下载各 task 的必要文件后统计(平台对齐口径)
+            cmd = [
+                sys.executable,
+                "-u",
+                str(WORKSPACE_PIPELINE_SCRIPT),
+                task["workspace_obs"],
+                out_dir,
+                "--obsutil", cfg["obsutil_path"],
+                "--concurrency", str(task.get("concurrency", 8)),
+            ]
+        else:
+            cmd = [
+                sys.executable,
+                "-u",
+                str(PIPELINE_SCRIPT),
+                task["assistant_obs"],
+                task["evaluator_obs"],
+                out_dir,
+                "--obsutil", cfg["obsutil_path"],
+            ]
+        proc_env = dict(os.environ)
+        if ssh_passwords:
+            if ssh_passwords.get("assistant"):
+                proc_env["SSH_PASSWORD_ASSISTANT"] = ssh_passwords["assistant"]
+            if ssh_passwords.get("evaluator"):
+                proc_env["SSH_PASSWORD_EVALUATOR"] = ssh_passwords["evaluator"]
+        exit_code, full_output = _stream_subprocess(cmd, env=proc_env)
         last_run_time = datetime.now().isoformat()
         last_duration = round(time.time() - t0, 1)
         last_error = None
@@ -375,16 +400,62 @@ def api_list_tasks():
     return {"tasks": [_task_summary(t) for t in load_tasks()]}
 
 
+def _extract_ssh_passwords(body: dict) -> dict:
+    """从请求体里取出一次性使用的 SSH 密码, 只在这次下载调用里传给子进程环境变量,
+    不落进 task/tasks.json(那里只存不含密码的 ssh://user@host/path)。"""
+    return {
+        "assistant": (body.get("assistant_ssh_password") or "").strip(),
+        "evaluator": (body.get("evaluator_ssh_password") or "").strip(),
+    }
+
+
+def _missing_ssh_passwords(task: dict, ssh_passwords: dict) -> list:
+    """重新采集时, 若来源是 ssh://, 密码从未持久化, 必须每次重新提交, 这里检查哪些侧缺密码。"""
+    missing = []
+    if task["assistant_obs"].startswith("ssh://") and not ssh_passwords.get("assistant"):
+        missing.append("assistant")
+    if task["evaluator_obs"].startswith("ssh://") and not ssh_passwords.get("evaluator"):
+        missing.append("evaluator")
+    return missing
+
+
 @app.post("/api/tasks")
 def api_create_task(body: dict):
     name = (body.get("name") or "").strip()
+    source_type = (body.get("source_type") or "session_analysis").strip()
+    workspace_obs = (body.get("workspace_obs") or "").strip()
     assistant_obs = (body.get("assistant_obs") or "").strip()
     evaluator_obs = (body.get("evaluator_obs") or "").strip()
-    if not name or not assistant_obs or not evaluator_obs:
-        return JSONResponse(
-            {"success": False, "message": "任务名称、assistant OBS 地址、eval OBS 地址均不能为空"},
-            status_code=400,
+
+    # workspace 下载并发数: 缺省 8, 限制在 [1, 64] 防止误填导致 OBS 限流/进程过多
+    try:
+        concurrency = int(body.get("concurrency") or 8)
+    except (TypeError, ValueError):
+        concurrency = 8
+    concurrency = max(1, min(64, concurrency))
+
+    if source_type == "workspace":
+        if not name or not workspace_obs:
+            return JSONResponse(
+                {"success": False, "message": "任务名称、workspace 来源不能为空"},
+                status_code=400,
+            )
+        ssh_passwords = {}  # workspace 来源仅支持 obs://, 不涉及 SSH 密码
+    else:
+        if not name or not assistant_obs or not evaluator_obs:
+            return JSONResponse(
+                {"success": False, "message": "任务名称、assistant 来源、eval 来源均不能为空"},
+                status_code=400,
+            )
+        ssh_passwords = _extract_ssh_passwords(body)
+        missing = _missing_ssh_passwords(
+            {"assistant_obs": assistant_obs, "evaluator_obs": evaluator_obs}, ssh_passwords
         )
+        if missing:
+            return JSONResponse(
+                {"success": False, "message": f"服务器路径来源({'/'.join(missing)})缺少密码"},
+                status_code=400,
+            )
 
     cfg = load_config()
     task_id = "t_" + uuid.uuid4().hex[:8]
@@ -392,6 +463,9 @@ def api_create_task(body: dict):
     task = {
         "id": task_id,
         "name": name,
+        "source_type": source_type,
+        "workspace_obs": workspace_obs,
+        "concurrency": concurrency,
         "assistant_obs": assistant_obs,
         "evaluator_obs": evaluator_obs,
         "output_dir": output_dir,
@@ -415,19 +489,29 @@ def api_create_task(body: dict):
             "message": "任务已创建，但当前有其他任务正在采集中，请稍后在任务列表手动点击「重新采集」",
         }
 
-    threading.Thread(target=run_pipeline, args=(task_id,), daemon=True).start()
+    threading.Thread(target=run_pipeline, args=(task_id, ssh_passwords), daemon=True).start()
     return {"success": True, "task": task, "started": True, "message": "任务已创建，正在采集数据"}
 
 
 @app.post("/api/tasks/{task_id}/trigger")
-def api_trigger_task(task_id: str):
+def api_trigger_task(task_id: str, body: dict = None):
     task = find_task(task_id)
     if not task:
         return JSONResponse({"success": False, "message": "任务不存在"}, status_code=404)
+
+    ssh_passwords = _extract_ssh_passwords(body or {})
+    missing = _missing_ssh_passwords(task, ssh_passwords)
+    if missing:
+        return JSONResponse(
+            {"success": False, "message": f"服务器路径来源({'/'.join(missing)})缺少密码，请重新输入",
+             "need_password": missing},
+            status_code=400,
+        )
+
     with _job_lock:
         if _job_state["running"]:
             return {"success": False, "message": "已有任务正在采集中，请稍候"}
-    threading.Thread(target=run_pipeline, args=(task_id,), daemon=True).start()
+    threading.Thread(target=run_pipeline, args=(task_id, ssh_passwords), daemon=True).start()
     return {"success": True, "message": "已开始采集"}
 
 
@@ -526,6 +610,47 @@ def api_task_sessions(
     }
 
 
+_VERDICT_FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*\})\s*```", re.DOTALL)
+
+
+def _extract_verdict(data: dict) -> Optional[dict]:
+    """evaluator 的最终裁决(completion/reason/rubric_checks 逐条核验)存在原始 json 顶层的
+    response.content 里, 是一段独立于 messages[] 的(可能被```json```包裹的) JSON 文本。
+    之前只裁剪 messages, 这段裁决内容完全没有传给前端, 所以需要单独解析出来。"""
+    resp = data.get("response")
+    if not isinstance(resp, dict):
+        return None
+    text = _extract_text(resp.get("content"))
+    if "rubric_checks" not in text:
+        return None
+    m = _VERDICT_FENCE_RE.search(text)
+    raw = m.group(1) if m else text.strip()
+    try:
+        obj = json.loads(raw)
+        if isinstance(obj, str):
+            obj = json.loads(obj)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    gate_status = obj.get("gate_status") if isinstance(obj.get("gate_status"), dict) else {}
+    rubric_checks = [
+        {
+            "kind": "gate" if rc.get("rubric_id") in gate_status else "reward",
+            "criterion": rc.get("criterion"),
+            "passed": rc.get("passed"),
+            "evidence": rc.get("evidence"),
+        }
+        for rc in (obj.get("rubric_checks") or []) if isinstance(rc, dict)
+    ]
+    return {
+        "completion": obj.get("completion"),
+        "reason": obj.get("reason"),
+        "inclination": obj.get("inclination"),
+        "rubric_checks": rubric_checks,
+    }
+
+
 def _load_simplified_trajectory(session: str, output_dir: str) -> Optional[dict]:
     """按 session(目录名) 定位原始轨迹 json 并裁剪为前端渲染用的结构。
     assistant/evaluator 两侧轨迹目录结构一致, 都是 <output_dir>/origin/*/<session>/*.json,
@@ -542,6 +667,7 @@ def _load_simplified_trajectory(session: str, output_dir: str) -> Optional[dict]
         "model": data.get("model"),
         "message_count": len(messages),
         "messages": [_simplify_message(m) for m in messages],
+        "verdict": _extract_verdict(data),
     }
 
 

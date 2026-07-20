@@ -1,22 +1,31 @@
 # -*- coding: utf-8 -*-
 """
-从 OBS 下载 assistant + evaluator 两个原始轨迹目录, 然后跑处理流水线。
+从 OBS 或远程服务器(SSH/SFTP) 下载 assistant + evaluator 两个原始轨迹目录, 然后跑处理流水线。
 
 流程:
-  1. 用 obsutil 把两个 obs 目录下载到 <out_dir>/origin/ (实时打印下载速度)。
+  1. 把两个来源目录下载到 <out_dir>/origin/ (实时打印下载进度)。
+     每个来源既可以是 obs://... 地址(走 obsutil), 也可以是 ssh://user@host/remote/path/
+     (走 paramiko SFTP, 适用于数据只落在某台服务器本地磁盘、还没传到 OBS 的情况)。
   2. 在 origin 下自动定位两个轨迹目录(含 session_report.xlsx 的为 assistant, 另一个为 evaluator),
      调用 run_pipeline.py 完成 筛选→转 pangu→统计。
 
 用法:
   python download_and_run.py <assistant_obs> <evaluator_obs> <out_dir> [--obsutil PATH]
 
-示例:
+示例(OBS):
   python download_and_run.py ^
     "obs://rl-agentdata/zhengnianzu/test/session_analysis/env-claude-99oR/key-5c33/ex-260716171238/" ^
     "obs://rl-agentdata/zhengnianzu/test/session_analysis/env-claude-99oR/key-122a/ex-260716170233/" ^
     output
+
+示例(SSH, 密码通过环境变量 SSH_PASSWORD_ASSISTANT / SSH_PASSWORD_EVALUATOR 传入, 不出现在命令行里):
+  SSH_PASSWORD_ASSISTANT=xxx python download_and_run.py \
+    "ssh://user@10.0.0.1/mnt/sdb/data/session/env-claude-99oR/26071621/key-1433/" \
+    "obs://rl-agentdata/.../ex-260716170233/" \
+    output
 """
-import os, sys, time, argparse, subprocess
+import os, sys, time, stat, argparse, subprocess
+from urllib.parse import urlparse
 
 HERE            = os.path.dirname(os.path.abspath(__file__))
 RUN_PIPELINE    = os.path.join(HERE, "run_pipeline.py")
@@ -25,8 +34,13 @@ REPORT_NAME     = "session_report.xlsx"
 
 
 def obs_leaf(obs_path):
-    """obs 路径末段目录名, 如 .../ex-260716171238/ -> ex-260716171238"""
+    """路径末段目录名, 如 .../ex-260716171238/ -> ex-260716171238。
+    对 obs:// 和 ssh:// 路径都适用, 因为只是纯字符串操作。"""
     return os.path.basename(obs_path.rstrip("/").rstrip("\\"))
+
+
+def is_ssh_url(path):
+    return path.startswith("ssh://")
 
 
 def human(n):
@@ -94,6 +108,77 @@ def download(obsutil, obs_path, dest_dir):
     print(f"  [ok] {obs_leaf(obs_path)}: {human(total)} / {dt:.1f}s = {human(speed)}/s (平均)", flush=True)
 
 
+def parse_ssh_url(ssh_url):
+    """ssh://user@host/remote/path/ -> (user, host, "/remote/path/")。
+    urlparse 对 ssh:// 能正确切出 netloc(user@host)和 path, 不需要手写正则。"""
+    u = urlparse(ssh_url)
+    if u.scheme != "ssh" or not u.username or not u.hostname or not u.path:
+        raise ValueError(f"非法的 ssh:// 地址(应为 ssh://user@host/remote/path/): {ssh_url}")
+    return u.username, u.hostname, u.path
+
+
+def download_ssh(ssh_url, dest_dir, password):
+    """通过 SFTP 把远程服务器上的一个目录递归下载到 dest_dir/<leaf>/, 与 obsutil 落盘方式一致
+    (dest_dir 传 origin/, 落成 origin/<leaf>/), 这样下游 run_pipeline.py 的目录探测逻辑不用改。
+
+    密码只作为函数参数短暂存在于这次调用栈里, 建完连接就不再需要, 不写日志、不进 dest_dir。
+    """
+    import paramiko
+
+    user, host, remote_path = parse_ssh_url(ssh_url)
+    remote_path = remote_path.rstrip("/") or "/"
+    leaf = obs_leaf(ssh_url)
+    local_root = os.path.join(dest_dir, leaf)
+    os.makedirs(local_root, exist_ok=True)
+
+    print(f"  $ sftp {user}@{host}:{remote_path} -> {local_root}", flush=True)
+    t0 = time.time()
+
+    transport = paramiko.Transport((host, 22))
+    try:
+        transport.connect(username=user, password=password)
+        sftp = paramiko.SFTPClient.from_transport(transport)
+        try:
+            n_files = [0]
+            n_bytes = [0]
+            last_print = [0.0]
+
+            def walk_download(remote_dir, local_dir):
+                os.makedirs(local_dir, exist_ok=True)
+                for entry in sftp.listdir_attr(remote_dir):
+                    r_path = remote_dir.rstrip("/") + "/" + entry.filename
+                    l_path = os.path.join(local_dir, entry.filename)
+                    if stat.S_ISDIR(entry.st_mode):
+                        walk_download(r_path, l_path)
+                    else:
+                        sftp.get(r_path, l_path)
+                        n_files[0] += 1
+                        n_bytes[0] += entry.st_size or 0
+                        now = time.time()
+                        if now - last_print[0] >= 0.2:
+                            elapsed = now - t0
+                            speed = n_bytes[0] / elapsed if elapsed > 0 else 0
+                            print(f"    已下载 {n_files[0]} 个文件 ({human(n_bytes[0])}, {human(speed)}/s)".ljust(90),
+                                  end="\r", flush=True)
+                            last_print[0] = now
+
+            walk_download(remote_path, local_root)
+            print()  # 收尾换行
+        finally:
+            sftp.close()
+    except paramiko.AuthenticationException:
+        raise RuntimeError(f"SSH 认证失败, 请检查用户名/密码: {user}@{host}")
+    except Exception as exc:
+        raise RuntimeError(f"SFTP 下载失败: {user}@{host}:{remote_path} - {exc}")
+    finally:
+        transport.close()
+
+    dt = time.time() - t0
+    total = dir_size(local_root)
+    speed = total / dt if dt > 0 else 0
+    print(f"  [ok] {leaf}: {human(total)} / {dt:.1f}s = {human(speed)}/s (平均)", flush=True)
+
+
 def find_traj_dirs(origin):
     """在 origin 下(递归)找轨迹目录: 含 session_report.xlsx 的为 assistant, 其它含时间戳子目录的为候选。
 
@@ -116,26 +201,39 @@ def find_traj_dirs(origin):
     return assistant, evaluator
 
 
+def fetch(obsutil, source, dest_dir, ssh_password_env):
+    """按 source 的 scheme 分发到 obsutil(obs://) 或 SFTP(ssh://)。
+    SSH 密码从环境变量读, 从不出现在命令行参数或日志里。"""
+    if is_ssh_url(source):
+        password = os.environ.get(ssh_password_env, "")
+        if not password:
+            raise RuntimeError(f"缺少 SSH 密码(环境变量 {ssh_password_env} 未设置): {source}")
+        download_ssh(source, dest_dir, password)
+    else:
+        download(obsutil, source, dest_dir)
+
+
 def main():
     ap = argparse.ArgumentParser(
-        description="从 OBS 下载两个轨迹目录后运行处理流水线",
+        description="从 OBS 或 SSH 服务器下载两个轨迹目录后运行处理流水线",
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("assistant_obs", help="assistant 轨迹的 obs 路径(含 session_report.xlsx)")
-    ap.add_argument("evaluator_obs", help="evaluator(质检) 轨迹的 obs 路径")
+    ap.add_argument("assistant_obs", help="assistant 轨迹来源: obs://... 或 ssh://user@host/remote/path/")
+    ap.add_argument("evaluator_obs", help="evaluator(质检) 轨迹来源: obs://... 或 ssh://user@host/remote/path/")
     ap.add_argument("out_dir",       help="输出目录(下载落到 <out_dir>/origin/, 结果落到 <out_dir>/)")
     ap.add_argument("--obsutil", default=DEFAULT_OBSUTIL, help=f"obsutil 路径(默认 {DEFAULT_OBSUTIL})")
     a = ap.parse_args()
 
-    if not os.path.exists(a.obsutil):
+    need_obsutil = not (is_ssh_url(a.assistant_obs) and is_ssh_url(a.evaluator_obs))
+    if need_obsutil and not os.path.exists(a.obsutil):
         ap.error(f"obsutil 不存在: {a.obsutil}")
 
     origin = os.path.join(a.out_dir, "origin")
     os.makedirs(origin, exist_ok=True)
 
     print(f"[1] 下载 assistant 轨迹 <- {a.assistant_obs}")
-    download(a.obsutil, a.assistant_obs, origin)
+    fetch(a.obsutil, a.assistant_obs, origin, "SSH_PASSWORD_ASSISTANT")
     print(f"[2] 下载 evaluator 轨迹 <- {a.evaluator_obs}")
-    download(a.obsutil, a.evaluator_obs, origin)
+    fetch(a.obsutil, a.evaluator_obs, origin, "SSH_PASSWORD_EVALUATOR")
 
     # 优先按 obs 末段名定位; 找不到再自动探测
     a_name, e_name = obs_leaf(a.assistant_obs), obs_leaf(a.evaluator_obs)
