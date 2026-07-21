@@ -1,19 +1,22 @@
 # -*- coding: utf-8 -*-
+import io
 import json
 import os
 import re
 import subprocess
 import sys
+import tarfile
 import threading
 import time
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
 
 import uvicorn
 from fastapi import FastAPI
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 HERE = Path(__file__).parent
@@ -1049,6 +1052,65 @@ def _ensure_workspace_evaluator(task: dict, session: str) -> Optional[dict]:
 
 # ── Hermes 来源(query1.json): 轨迹+评测同在一个文件, 无 agents/*/sessions ────────
 
+def _load_hermes_profile_session(json_path: Path, session: str) -> Optional[dict]:
+    """解析 Hermes 的 profiles/*/sessions/*.json(标准 OpenAI 格式: {messages:[{role,content,tool_calls}]}),
+    裁剪为前端渲染结构。与 session_analysis 侧同格式, 故复用 _simplify_message。"""
+    if not json_path or not json_path.exists():
+        return None
+    try:
+        with open(json_path, encoding="utf-8", errors="replace") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+    messages = data.get("messages", [])
+    return {
+        "session": session,
+        "source_file": str(json_path),
+        "model": data.get("model"),
+        "message_count": len(messages),
+        "messages": [_simplify_message(m) for m in messages],
+    }
+
+
+def _ensure_hermes_evaluator(task: dict, session: str) -> Optional[dict]:
+    """加载 Hermes evaluator 完整轨迹: <task>/profiles/evaluator/sessions/*.json。
+    本地无则用 workspace_obs 按需临时下载该 session 的 evaluator profile session(懒加载,
+    默认批量下载已不含 evaluator 以省空间, 见 download_workspace_and_run.py 的过滤规则)。
+    下载失败/无地址时返回 None(前端据此隐藏 evaluator 页), 不影响 assistant 与裁决展示。"""
+    output_dir = task["output_dir"]
+    task_dir = _workspace_task_dir(session, output_dir)
+    if not task_dir:
+        return None
+
+    def _find_local():
+        cands = sorted(task_dir.glob("profiles/evaluator/sessions/*.json"),
+                       key=lambda p: p.stat().st_size, reverse=True)
+        return cands[0] if cands else None
+
+    json_path = _find_local()
+    if not json_path:
+        # 按需下载: <workspace_obs>/<session>/ 只拉 evaluator profile session json
+        workspace_obs = (task.get("workspace_obs") or "").rstrip("/")
+        if not workspace_obs:
+            return None
+        cfg = load_config()
+        task_obs = f"{workspace_obs}/{session}/"
+        origin = str(origin_dir(output_dir))
+        cmd = [
+            cfg["obsutil_path"], "cp", task_obs, origin, "-r", "-f",
+            "-include", "*profiles/evaluator/sessions/*.json",
+        ]
+        try:
+            subprocess.run(cmd, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=120)
+        except Exception:
+            return None
+        json_path = _find_local()
+    if not json_path:
+        return None
+    return _load_hermes_profile_session(json_path, session)
+
+
 def _find_query1_json(session: str, output_dir: str) -> Optional[Path]:
     """定位 Hermes 的 query1.json: <output_dir>/origin/<session>/logs/trajectories/*/query*.json。
     多时间戳目录时取最大者(与统计侧一致)。"""
@@ -1171,8 +1233,17 @@ def api_task_session_detail(task_id: str, session: str, eval_qc: Optional[str] =
             return JSONResponse({"found": False, "message": "query1.json 解析失败"}, status_code=404)
         result = {"found": True, **traj}
         result["verdict"] = _query1_verdict(query1)
-        # Hermes 评测就在 query1.json 里, 无独立 evaluator 轨迹
-        result["evaluator"] = None
+        # 裁决(rubric/completion)在 query1.json 里, 已挂到 verdict 面板。
+        # evaluator 完整轨迹是独立的 profiles/evaluator/sessions/*.json, 默认不随批量下载,
+        # 仅在前端明确请求(load_evaluator)时按需拉取(懒加载)。
+        if load_evaluator:
+            evaluator = _ensure_hermes_evaluator(task, session)
+            if evaluator is not None:
+                # 把 query1 裁决也挂到 evaluator 页, 复用 rubric 面板
+                evaluator["verdict"] = result["verdict"]
+            result["evaluator"] = evaluator
+        else:
+            result["evaluator"] = None
         return result
 
     assistant = _load_simplified_trajectory(session, task["output_dir"])
@@ -1186,6 +1257,69 @@ def api_task_session_detail(task_id: str, session: str, eval_qc: Optional[str] =
         result["evaluator"] = evaluator  # 找不到时为 None, 前端据此隐藏 evaluator 标签页
 
     return result
+
+
+def _iter_tar_stream(root_dir: Path, arcname: str, chunk_size: int = 1024 * 1024):
+    """把 root_dir 流式打包成 tar(不压缩)按块 yield, 内存占用恒定, 不受目录大小影响。
+    origin 目录可达数 GB / 上万文件, 全读进内存或压缩都不可行, 故用非压缩流式 tar:
+    tarfile 以 'w|' 流模式写入一个自定义的 fileobj, 每积累到一块就交出去。"""
+    class _Buffer(io.RawIOBase):
+        def __init__(self):
+            self.chunks = []
+        def write(self, b):
+            self.chunks.append(bytes(b))
+            return len(b)
+
+    buf = _Buffer()
+    tar = tarfile.open(fileobj=buf, mode="w|")  # 流式, 不压缩(上万小 json, gzip 只拖慢下载)
+    try:
+        for path in sorted(root_dir.rglob("*")):
+            tar.add(path, arcname=os.path.join(arcname, path.relative_to(root_dir).as_posix()),
+                    recursive=False)
+            # 把 tarfile 已写入 buf 的数据攒够一块就交出去
+            if sum(len(c) for c in buf.chunks) >= chunk_size:
+                data = b"".join(buf.chunks)
+                buf.chunks = []
+                yield data
+    finally:
+        tar.close()  # 补齐 tar 尾部块
+    if buf.chunks:
+        yield b"".join(buf.chunks)
+
+
+@app.get("/api/tasks/{task_id}/download-origin")
+def api_download_origin(task_id: str):
+    """把该任务本地已下载的原始轨迹目录(<output_dir>/origin/)流式打包成 tar 供下载。
+    用于把本地这份原始数据整包分享给同事, 不重新访问 OBS。"""
+    task = find_task(task_id)
+    if not task:
+        return JSONResponse({"success": False, "message": "任务不存在"}, status_code=404)
+
+    od = origin_dir(task["output_dir"])
+    if not od.is_dir() or not any(od.iterdir()):
+        return JSONResponse(
+            {"success": False, "message": "该任务本地暂无原始轨迹数据(可能尚未采集或已被清理)"},
+            status_code=404,
+        )
+
+    # ASCII 兜底名(HTTP 头只能是 latin-1, 中文/特殊字符全替成 _; re.ASCII 让 \w 不匹配中文),
+    # 真实中文任务名走 RFC 5987 的 filename* (UTF-8 编码), 现代浏览器优先用它。
+    ascii_name = re.sub(r"[^\w.\-]", "_", task.get("name") or task_id, flags=re.ASCII).strip("_") or task_id
+    utf8_name = re.sub(r"[\\/:*?\"<>|]", "_", task.get("name") or task_id)  # 仅去掉文件系统非法字符
+    ascii_filename = f"{ascii_name}_origin.tar"
+    utf8_filename = f"{utf8_name}_origin.tar"
+    headers = {
+        "Content-Disposition": (
+            f"attachment; filename=\"{ascii_filename}\"; "
+            f"filename*=UTF-8''{quote(utf8_filename)}"
+        )
+    }
+    # tar 内顶层目录用 ASCII 名, 跨平台解包不出乱码
+    return StreamingResponse(
+        _iter_tar_stream(od, arcname=f"{ascii_name}_origin"),
+        media_type="application/x-tar",
+        headers=headers,
+    )
 
 
 @app.get("/api/job-status")
