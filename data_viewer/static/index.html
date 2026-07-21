@@ -96,13 +96,18 @@ body{
 }
 @keyframes spin{to{transform:rotate(360deg)}}
 .traj-viewer{margin-top:10px;max-height:420px;overflow:auto;border:1px solid var(--border);border-radius:6px;background:var(--bg-0)}
-.traj-meta{font-size:11px;color:var(--text-2);padding:8px 12px;border-bottom:1px solid var(--border);position:sticky;top:0;background:var(--bg-0)}
+.traj-meta{font-size:11px;color:var(--text-2);padding:8px 12px;border-bottom:1px solid var(--border);position:sticky;top:0;background:var(--bg-0);display:flex;align-items:center;justify-content:space-between}
+.traj-toolbar{display:flex;gap:2px}
 .traj-msg{padding:10px 12px;border-bottom:1px solid rgba(0,217,255,.06);display:flex;gap:10px}
 .traj-msg:last-child{border-bottom:none}
 .traj-msg-role{
-  flex-shrink:0;width:64px;font-size:10px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;
+  flex-shrink:0;width:80px;font-size:10px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;
   padding-top:2px;font-family:ui-monospace,monospace;
 }
+.traj-caret{color:var(--text-2);font-size:9px}
+.traj-collapsed-hint{color:var(--text-2);font-size:11px;font-style:italic;cursor:pointer}
+.traj-more{color:var(--neon-cyan);font-size:11px;cursor:pointer;white-space:nowrap}
+.traj-more:hover{text-decoration:underline}
 .role-system .traj-msg-role{color:var(--text-2)}
 .role-user .traj-msg-role{color:var(--neon-cyan)}
 .role-assistant .traj-msg-role{color:var(--neon-purple)}
@@ -440,7 +445,7 @@ body{
         </template>
         <span v-else style="color:var(--text-2)">无</span>
       </el-descriptions-item>
-      <el-descriptions-item label="Eval QC Trace ID">
+      <el-descriptions-item v-if="!isWorkspaceTask" label="Eval QC Trace ID">
         <span style="font-family:ui-monospace,monospace;font-size:12px;color:var(--text-1)">{{ selectedSession.eval_qc || '—' }}</span>
       </el-descriptions-item>
     </el-descriptions>
@@ -456,21 +461,33 @@ body{
 
       <div v-if="trajLoaded" class="traj-tabs">
         <div class="traj-tab" :class="{active: trajTab==='assistant'}" @click="trajTab='assistant'">Assistant 轨迹</div>
-        <div v-if="trajData.evaluator" class="traj-tab" :class="{active: trajTab==='evaluator'}" @click="trajTab='evaluator'">Evaluator 轨迹</div>
-        <div v-else-if="selectedSession.eval_qc" class="traj-tab traj-tab-disabled">Evaluator 轨迹（未找到）</div>
+        <!-- workspace: evaluator 轨迹按需懒加载, 点击时才拉 -->
+        <div v-if="isWorkspaceTask" class="traj-tab" :class="{active: trajTab==='evaluator'}" @click="onClickEvaluatorTab">
+          Evaluator 轨迹<span v-if="evalLoading"> …加载中</span>
+        </div>
+        <!-- session_analysis: 已随详情返回 -->
+        <template v-else>
+          <div v-if="trajData.evaluator" class="traj-tab" :class="{active: trajTab==='evaluator'}" @click="trajTab='evaluator'">Evaluator 轨迹</div>
+          <div v-else-if="selectedSession.eval_qc" class="traj-tab traj-tab-disabled">Evaluator 轨迹（未找到）</div>
+        </template>
       </div>
 
-      <div v-if="trajTab === 'evaluator' && trajLoaded && trajData.evaluator" class="rubric-panel">
-        <template v-if="trajData.evaluator.verdict">
+      <div v-if="trajTab === 'evaluator' && evalLoading" class="traj-loading">
+        <span class="traj-spinner"></span> 正在按需下载 evaluator 轨迹...
+      </div>
+      <el-alert v-if="trajTab === 'evaluator' && evalError" :title="evalError" type="warning" show-icon :closable="false" style="margin-top:10px"></el-alert>
+
+      <div v-if="trajTab === 'evaluator' && trajLoaded && evalVerdict" class="rubric-panel">
+        <template v-if="evalVerdict">
           <div class="rubric-summary">
-            <span class="rubric-completion" :style="{color: completionColor(trajData.evaluator.verdict.completion)}">
-              Completion: {{ trajData.evaluator.verdict.completion ?? '—' }}
+            <span class="rubric-completion" :style="{color: completionColor(evalVerdict.completion)}">
+              Completion: {{ evalVerdict.completion ?? '—' }}
             </span>
-            <span v-if="trajData.evaluator.verdict.inclination" class="rubric-inclination">裁决倾向: {{ trajData.evaluator.verdict.inclination }}</span>
+            <span v-if="evalVerdict.inclination" class="rubric-inclination">裁决倾向: {{ evalVerdict.inclination }}</span>
           </div>
-          <div v-if="trajData.evaluator.verdict.reason" class="rubric-reason">{{ trajData.evaluator.verdict.reason }}</div>
-          <div v-if="trajData.evaluator.verdict.rubric_checks && trajData.evaluator.verdict.rubric_checks.length" class="rubric-list">
-            <div v-for="(rc, i) in trajData.evaluator.verdict.rubric_checks" :key="i" class="rubric-item" :class="{'rubric-fail': !rc.passed}">
+          <div v-if="evalVerdict.reason" class="rubric-reason">{{ evalVerdict.reason }}</div>
+          <div v-if="evalVerdict.rubric_checks && evalVerdict.rubric_checks.length" class="rubric-list">
+            <div v-for="(rc, i) in evalVerdict.rubric_checks" :key="i" class="rubric-item" :class="{'rubric-fail': !rc.passed}">
               <div class="rubric-item-hdr">
                 <el-tag :type="rc.kind === 'gate' ? 'warning' : 'info'" size="small" effect="dark">{{ rc.kind === 'gate' ? 'Gate' : 'Reward' }}</el-tag>
                 <el-tag :type="rc.passed ? 'success' : 'danger'" size="small">{{ rc.passed ? '满足 (1)' : '不满足 (0)' }}</el-tag>
@@ -485,22 +502,37 @@ body{
 
       <div v-if="trajLoaded && activeTrajData" class="traj-viewer">
         <div class="traj-meta">
-          共 {{ activeTrajData.message_count }} 条消息{{ activeTrajData.model ? ' · 模型 ' + activeTrajData.model : '' }}
+          <span>共 {{ activeTrajData.message_count }} 条消息{{ activeTrajData.model ? ' · 模型 ' + activeTrajData.model : '' }}</span>
+          <span class="traj-toolbar">
+            <el-button size="small" text @click="collapseAllMsgs(true)">全部折叠</el-button>
+            <el-button size="small" text @click="collapseAllMsgs(false)">全部展开</el-button>
+          </span>
         </div>
         <div class="traj-msg" v-for="(m, i) in activeTrajData.messages" :key="i" :class="'role-' + m.role">
-          <div class="traj-msg-role">{{ roleLabel(m.role) }}</div>
+          <div class="traj-msg-role" @click="toggleMsg(i)" style="cursor:pointer;user-select:none">
+            <span class="traj-caret">{{ isMsgCollapsed(i) ? '▶' : '▼' }}</span> {{ roleLabel(m.role) }}
+          </div>
           <div class="traj-msg-body">
-            <div v-if="m.reasoning_content" class="traj-reasoning">
-              {{ m.reasoning_content }}<span v-if="m.reasoning_truncated" class="traj-cut"> …(已截断)</span>
-            </div>
-            <div v-if="m.content" class="traj-content">
-              {{ m.content }}<span v-if="m.truncated" class="traj-cut"> …(已截断)</span>
-            </div>
-            <div v-if="m.tool_calls && m.tool_calls.length" class="traj-toolcalls">
-              <div v-for="(tc, j) in m.tool_calls" :key="j" class="traj-toolcall">
-                🔧 {{ tc.name }}<span v-if="tc.arguments">({{ tc.arguments }})</span>
+            <div v-if="isMsgCollapsed(i)" class="traj-collapsed-hint" @click="toggleMsg(i)">（已折叠，点击展开）</div>
+            <template v-else>
+              <div v-if="m.reasoning_content" class="traj-reasoning">
+                <span>{{ displayText(m.reasoning_content, i, 'r') }}</span>
+                <span v-if="isLong(m.reasoning_content)" class="traj-more" @click="toggleText(i, 'r')">
+                  {{ isTextExpanded(i, 'r') ? ' 收起 ▲' : ' …展开看全文 ▼' }}
+                </span>
               </div>
-            </div>
+              <div v-if="m.content" class="traj-content">
+                <span>{{ displayText(m.content, i, 'c') }}</span>
+                <span v-if="isLong(m.content)" class="traj-more" @click="toggleText(i, 'c')">
+                  {{ isTextExpanded(i, 'c') ? ' 收起 ▲' : ' …展开看全文 ▼' }}
+                </span>
+              </div>
+              <div v-if="m.tool_calls && m.tool_calls.length" class="traj-toolcalls">
+                <div v-for="(tc, j) in m.tool_calls" :key="j" class="traj-toolcall">
+                  🔧 {{ tc.name }}<span v-if="tc.arguments">({{ tc.arguments }})</span>
+                </div>
+              </div>
+            </template>
           </div>
         </div>
       </div>
@@ -558,6 +590,10 @@ createApp({
       trajError: '',
       trajData: null,
       trajTab: 'assistant',
+      evalLoading: false,
+      evalError: '',
+      msgCollapsed: {},   // 详情: 每块是否折叠, key = `${tab}:${i}`
+      textExpanded: {},   // 详情: 长文本是否展开看全文, key = `${tab}:${i}:${kind}`
       _pollTimer: null,
       _tickTimer: null,
       nowTick: Date.now(),
@@ -567,6 +603,9 @@ createApp({
   computed: {
     activeTask() {
       return this.tasks.find(t => t.id === this.activeTaskId) || null
+    },
+    isWorkspaceTask() {
+      return this.activeTask && this.activeTask.source_type === 'workspace'
     },
     runningTaskName() {
       if (!this.jobStatus.running) return ''
@@ -582,6 +621,12 @@ createApp({
       if (!this.trajData) return null
       if (this.trajTab === 'evaluator') return this.trajData.evaluator || null
       return this.trajData
+    },
+    evalVerdict() {
+      // workspace: 裁决来自 log, 挂在 trajData.verdict(A 部分, 无需等 evaluator 轨迹);
+      // session_analysis: 挂在 trajData.evaluator.verdict
+      if (!this.trajData) return null
+      return (this.trajData.evaluator && this.trajData.evaluator.verdict) || this.trajData.verdict || null
     },
     funnelRows() {
       const total = (this.stats.filtered_count || 0) + (this.stats.dropped_count || 0)
@@ -838,11 +883,6 @@ createApp({
 
     onFilterChange() { this.currentPage = 1; this.loadSessions() },
     openDetail(row) {
-      // workspace 来源暂不支持逐条轨迹查看（只做统计）
-      if (this.activeTask && this.activeTask.source_type === 'workspace') {
-        ElementPlus.ElMessage.info('workspace 任务暂只提供统计，逐条轨迹查看后续再支持')
-        return
-      }
       this.selectedSession = row
       this.detailVisible = true
       this.trajLoading = false
@@ -850,6 +890,10 @@ createApp({
       this.trajError = ''
       this.trajData = null
       this.trajTab = 'assistant'
+      this.evalLoading = false
+      this.evalError = ''
+      this.msgCollapsed = {}
+      this.textExpanded = {}
     },
     async loadTrajectory() {
       if (!this.selectedSession || !this.activeTaskId) return
@@ -857,7 +901,8 @@ createApp({
       this.trajError = ''
       try {
         const params = {}
-        if (this.selectedSession.has_eval && this.selectedSession.eval_qc) {
+        // session_analysis: 用 eval_qc 关联 evaluator; workspace: evaluator 走懒加载, 首次不带
+        if (!this.isWorkspaceTask && this.selectedSession.has_eval && this.selectedSession.eval_qc) {
           params.eval_qc = this.selectedSession.eval_qc
         }
         const r = await axios.get(`/api/tasks/${this.activeTaskId}/session-detail/${encodeURIComponent(this.selectedSession.session)}`, { params })
@@ -872,6 +917,56 @@ createApp({
       } finally {
         this.trajLoading = false
       }
+    },
+    // workspace: evaluator 完整轨迹按需临时下载(懒加载), 首次点击 tab 时触发
+    async loadEvaluatorTrajectory() {
+      if (!this.isWorkspaceTask || !this.selectedSession || !this.activeTaskId) return
+      if (this.trajData && this.trajData.evaluator) return  // 已加载
+      this.evalLoading = true
+      this.evalError = ''
+      try {
+        const r = await axios.get(`/api/tasks/${this.activeTaskId}/session-detail/${encodeURIComponent(this.selectedSession.session)}`,
+          { params: { load_evaluator: 1 } })
+        if (r.data.found && r.data.evaluator) {
+          this.trajData = { ...this.trajData, evaluator: r.data.evaluator }
+        } else {
+          this.evalError = 'evaluator 轨迹不可用（该 task 可能无 evaluator 轨迹，或按需下载失败）'
+        }
+      } catch (e) {
+        this.evalError = e.response?.data?.message || '加载 evaluator 轨迹失败'
+      } finally {
+        this.evalLoading = false
+      }
+    },
+    onClickEvaluatorTab() {
+      this.trajTab = 'evaluator'
+      if (this.isWorkspaceTask && (!this.trajData || !this.trajData.evaluator)) {
+        this.loadEvaluatorTrajectory()
+      }
+    },
+    // ── 详情折叠/展开 (#1 + #3) ──
+    _msgKey(i) { return this.trajTab + ':' + i },
+    _txtKey(i, kind) { return this.trajTab + ':' + i + ':' + kind },
+    isMsgCollapsed(i) { return !!this.msgCollapsed[this._msgKey(i)] },
+    toggleMsg(i) {
+      const k = this._msgKey(i)
+      this.msgCollapsed = { ...this.msgCollapsed, [k]: !this.msgCollapsed[k] }
+    },
+    collapseAllMsgs(val) {
+      const msgs = (this.activeTrajData && this.activeTrajData.messages) || []
+      const next = { ...this.msgCollapsed }
+      msgs.forEach((_, i) => { next[this._msgKey(i)] = val })
+      this.msgCollapsed = next
+    },
+    isLong(text) { return typeof text === 'string' && text.length > 600 },
+    isTextExpanded(i, kind) { return !!this.textExpanded[this._txtKey(i, kind)] },
+    toggleText(i, kind) {
+      const k = this._txtKey(i, kind)
+      this.textExpanded = { ...this.textExpanded, [k]: !this.textExpanded[k] }
+    },
+    displayText(text, i, kind) {
+      if (!this.isLong(text) || this.isTextExpanded(i, kind)) return text
+      return text.slice(0, 600)
     },
     roleLabel(role) {
       return { system: 'SYSTEM', user: 'USER', assistant: 'ASSISTANT', tool: 'TOOL' }[role] || (role || '').toUpperCase()

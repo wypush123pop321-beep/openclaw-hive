@@ -20,6 +20,10 @@ HERE = Path(__file__).parent
 PIPELINE_SCRIPT = HERE.parent / "traj_pipeline" / "download_and_run.py"
 WORKSPACE_PIPELINE_SCRIPT = HERE.parent / "traj_pipeline" / "download_workspace_and_run.py"
 STATIC_DIR = HERE / "static"
+
+# 复用轨迹统计里的 evaluator 首轮定位逻辑(首轮 = 编号最小的 turn, 见 #4)
+sys.path.insert(0, str(HERE.parent))
+import traj_stats  # noqa: E402
 CONFIG_FILE = HERE / "config.json"
 TASKS_FILE = HERE / "tasks.json"
 STATS_FILE_NAME = "filter_stats.json"
@@ -193,7 +197,9 @@ def find_session_json(session: str, output_dir: str) -> Optional[Path]:
     return None
 
 
-_MAX_MSG_CHARS = 6000
+# 仅作极端情况的安全上限(防单条消息达数百 KB 撑爆响应); 正常内容不截断,
+# 详情视图靠前端「默认折叠 + 点击展开看全文」控制可读性(见 #1/#3)。
+_MAX_MSG_CHARS = 200000
 
 
 def _extract_text(content) -> str:
@@ -643,12 +649,18 @@ def _extract_verdict(data: dict) -> Optional[dict]:
         }
         for rc in (obj.get("rubric_checks") or []) if isinstance(rc, dict)
     ]
+    rubric_checks = _sort_rubric_gate_first(rubric_checks)
     return {
         "completion": obj.get("completion"),
         "reason": obj.get("reason"),
         "inclination": obj.get("inclination"),
         "rubric_checks": rubric_checks,
     }
+
+
+def _sort_rubric_gate_first(rubric_checks: list) -> list:
+    """把 gate 项排在 reward 项前面(稳定排序, 组内保持原顺序)。见 #2。"""
+    return sorted(rubric_checks, key=lambda rc: 0 if rc.get("kind") == "gate" else 1)
 
 
 def _load_simplified_trajectory(session: str, output_dir: str) -> Optional[dict]:
@@ -671,11 +683,310 @@ def _load_simplified_trajectory(session: str, output_dir: str) -> Optional[dict]
     }
 
 
+# ── workspace 来源的轨迹查看(assistant .jsonl + log 裁决 + 按需拉 evaluator) ──────
+
+def _simplify_workspace_message(role: str, parts: list) -> Optional[dict]:
+    """把 workspace assistant/evaluator .jsonl 的一条 message 的 content 部件列表,
+    映射成前端已认的结构 {role, content, reasoning_content, tool_calls, truncated}。
+    部件类型: thinking / text / toolCall / (toolResult 侧的) text。"""
+    texts, reasonings, tool_calls = [], [], []
+    for p in parts:
+        if not isinstance(p, dict):
+            continue
+        t = p.get("type")
+        if t == "text":
+            if p.get("text"):
+                texts.append(p["text"])
+        elif t == "thinking":
+            if p.get("thinking"):
+                reasonings.append(p["thinking"])
+        elif t == "toolCall":
+            tool_calls.append({
+                "name": p.get("name"),
+                "arguments": p.get("arguments"),
+            })
+
+    content = "\n".join(texts)
+    reasoning = "\n".join(reasonings)
+    truncated = False
+    if len(content) > _MAX_MSG_CHARS:
+        content = content[:_MAX_MSG_CHARS]
+        truncated = True
+
+    out = {"role": role, "content": content, "truncated": truncated}
+    if reasoning:
+        if len(reasoning) > _MAX_MSG_CHARS:
+            reasoning = reasoning[:_MAX_MSG_CHARS]
+            out["reasoning_truncated"] = True
+        out["reasoning_content"] = reasoning
+    if tool_calls:
+        out["tool_calls"] = tool_calls
+    return out
+
+
+def _load_workspace_jsonl_trajectory(jsonl_path: Path, session: str) -> Optional[dict]:
+    """解析 workspace 的原始 .jsonl(session/message 混合事件流),裁剪为前端渲染结构。
+    只取 type=='message' 的行; content 可能是字符串(user)或部件列表(assistant/toolResult)。"""
+    if not jsonl_path or not jsonl_path.exists():
+        return None
+    messages = []
+    model = None
+    with open(jsonl_path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            otype = obj.get("type")
+            if otype == "model_change" and obj.get("model"):
+                model = obj["model"]
+                continue
+            if otype != "message":
+                continue
+            msg = obj.get("message") or {}
+            role = msg.get("role")
+            content = msg.get("content")
+            if isinstance(content, str):
+                text = content
+                truncated = False
+                if len(text) > _MAX_MSG_CHARS:
+                    text = text[:_MAX_MSG_CHARS]
+                    truncated = True
+                messages.append({"role": role, "content": text, "truncated": truncated})
+            elif isinstance(content, list):
+                simplified = _simplify_workspace_message(role, content)
+                if simplified:
+                    messages.append(simplified)
+    return {
+        "session": session,
+        "source_file": str(jsonl_path),
+        "model": model,
+        "message_count": len(messages),
+        "messages": messages,
+    }
+
+
+def _workspace_task_dir(session: str, output_dir: str) -> Optional[Path]:
+    """workspace 的 per_session[].session 就是 task 目录名, 定位 <output_dir>/origin/<session>/。"""
+    if "/" in session or ".." in session:
+        return None
+    d = origin_dir(output_dir) / session
+    return d if d.is_dir() else None
+
+
+def _load_workspace_assistant(session: str, output_dir: str) -> Optional[dict]:
+    """加载 workspace assistant 轨迹: <task>/agents/assistant*/sessions/<非trajectory>.jsonl。"""
+    task_dir = _workspace_task_dir(session, output_dir)
+    if not task_dir:
+        return None
+    for jsonl in sorted(task_dir.glob("agents/assistant*/sessions/*.jsonl")):
+        if "trajectory" in jsonl.name:
+            continue
+        traj = _load_workspace_jsonl_trajectory(jsonl, session)
+        if traj:
+            return traj
+    return None
+
+
+def _extract_verdict_from_log(session: str, output_dir: str) -> Optional[dict]:
+    """从 <task>/logs/<task>.log 的「首轮」evaluator 块解析裁决, 归一化成与 _extract_verdict 同款结构。
+    首轮 = 编号最小的 turn(见 #4), 复用 traj_stats.extract_first_evaluator_obj。"""
+    task_dir = _workspace_task_dir(session, output_dir)
+    if not task_dir:
+        return None
+    log_path = task_dir / "logs" / (session + ".log")
+    if not log_path.exists():
+        return None
+    obj = traj_stats.extract_first_evaluator_obj(str(log_path))
+    if not isinstance(obj, dict):   # None(无裁决) 或 '__BADJSON__'(解析失败)
+        return None
+    gate_status = obj.get("gate_status") if isinstance(obj.get("gate_status"), dict) else {}
+    rubric_checks = [
+        {
+            "kind": "gate" if rc.get("rubric_id") in gate_status else "reward",
+            "criterion": rc.get("criterion"),
+            "passed": rc.get("passed"),
+            "evidence": rc.get("evidence"),
+        }
+        for rc in (obj.get("rubric_checks") or []) if isinstance(rc, dict)
+    ]
+    rubric_checks = _sort_rubric_gate_first(rubric_checks)
+    return {
+        "completion": obj.get("completion"),
+        "reason": obj.get("reason"),
+        "inclination": obj.get("inclination"),
+        "rubric_checks": rubric_checks,
+    }
+
+
+_INCL_STR_RE = re.compile(r'"inclination"\s*:\s*"([^"]+)"')
+_REASON_STR_RE = re.compile(r'"reason"\s*:\s*"((?:[^"\\]|\\.)*)"')
+_COMP_NUM_RE = re.compile(r'"completion"\s*:\s*(null|-?[0-9.]+)')
+
+
+def _eval_traj_verdict_text(jsonl_path: Path) -> Optional[str]:
+    """evaluator 轨迹里最后一条含 rubric_checks + inclination 的 assistant 文本(裁决原文)。"""
+    if not jsonl_path or not jsonl_path.exists():
+        return None
+    last = None
+    with open(jsonl_path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if obj.get("type") != "message":
+                continue
+            msg = obj.get("message") or {}
+            if msg.get("role") != "assistant":
+                continue
+            c = msg.get("content")
+            if isinstance(c, str):
+                txt = c
+            elif isinstance(c, list):
+                txt = "\n".join(p.get("text", "") for p in c
+                                if isinstance(p, dict) and p.get("type") == "text")
+            else:
+                txt = ""
+            if "rubric_checks" in txt and "inclination" in txt:
+                last = txt
+    return last
+
+
+def _verdict_from_eval_traj_text(txt: str) -> Optional[dict]:
+    """把 evaluator 轨迹裁决原文构造成 verdict dict。
+    先尝试整块 json.loads(可拿到逐条 rubric); 失败则用正则退化取 completion/inclination/reason
+    (裁决 JSON 常含非法转义, 整块解析不可靠, 此时 rubric 列表留空, 用户仍可在 evaluator 轨迹里看原文)。"""
+    if not txt:
+        return None
+    m = _VERDICT_FENCE_RE.search(txt)
+    raw = m.group(1) if m else txt
+    obj = None
+    try:
+        o = json.loads(raw)
+        if isinstance(o, dict):
+            obj = o
+    except (json.JSONDecodeError, TypeError):
+        obj = None
+    if obj is not None:
+        gate_status = obj.get("gate_status") if isinstance(obj.get("gate_status"), dict) else {}
+        rubric_checks = _sort_rubric_gate_first([
+            {
+                "kind": "gate" if rc.get("rubric_id") in gate_status else "reward",
+                "criterion": rc.get("criterion"),
+                "passed": rc.get("passed"),
+                "evidence": rc.get("evidence"),
+            }
+            for rc in (obj.get("rubric_checks") or []) if isinstance(rc, dict)
+        ])
+        return {
+            "completion": obj.get("completion"),
+            "reason": obj.get("reason"),
+            "inclination": obj.get("inclination"),
+            "rubric_checks": rubric_checks,
+            "verdict_source": "eval_traj",
+        }
+    # 退化: 正则取标量
+    cm = _COMP_NUM_RE.findall(txt)
+    completion = None
+    if cm and cm[-1] != "null":
+        try:
+            completion = float(cm[-1])
+        except ValueError:
+            completion = None
+    im = _INCL_STR_RE.search(txt)
+    rm = _REASON_STR_RE.search(txt)
+    return {
+        "completion": completion,
+        "reason": rm.group(1) if rm else None,
+        "inclination": im.group(1) if im else None,
+        "rubric_checks": [],
+        "verdict_source": "eval_traj_partial",
+    }
+
+
+def _extract_workspace_verdict(session: str, output_dir: str) -> Optional[dict]:
+    """workspace 首轮裁决: 先读 log; log 无裁决时回退本地 evaluator 轨迹(见方案 B)。"""
+    verdict = _extract_verdict_from_log(session, output_dir)
+    if verdict is not None:
+        return verdict
+    task_dir = _workspace_task_dir(session, output_dir)
+    if not task_dir:
+        return None
+    ev = traj_stats.find_evaluator_trajectory(str(task_dir))
+    if not ev:
+        return None
+    return _verdict_from_eval_traj_text(_eval_traj_verdict_text(Path(ev)))
+
+
+def _ensure_workspace_evaluator(task: dict, session: str) -> Optional[dict]:
+    """加载 workspace evaluator 轨迹; 本地无则用 workspace_obs 按需临时下载该 task 的 evaluator jsonl。
+    下载失败/无地址时返回 None(前端据此隐藏 evaluator 页), 不影响 assistant 与裁决展示。"""
+    output_dir = task["output_dir"]
+    task_dir = _workspace_task_dir(session, output_dir)
+    if not task_dir:
+        return None
+
+    def _find_local():
+        for jsonl in sorted(task_dir.glob("agents/evaluator/sessions/*.jsonl")):
+            if "trajectory" in jsonl.name:
+                continue
+            return jsonl
+        return None
+
+    jsonl = _find_local()
+    if not jsonl:
+        # 按需下载: <workspace_obs>/<session>/ 只拉 evaluator 非 trajectory jsonl
+        workspace_obs = (task.get("workspace_obs") or "").rstrip("/")
+        if not workspace_obs:
+            return None
+        cfg = load_config()
+        task_obs = f"{workspace_obs}/{session}/"
+        origin = str(origin_dir(output_dir))
+        cmd = [
+            cfg["obsutil_path"], "cp", task_obs, origin, "-r", "-f",
+            "-include", "*evaluator*sessions*.jsonl",
+            "-exclude", "*trajectory*",
+        ]
+        try:
+            subprocess.run(cmd, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=120)
+        except Exception:
+            return None
+        jsonl = _find_local()
+    if not jsonl:
+        return None
+    return _load_workspace_jsonl_trajectory(jsonl, session)
+
+
 @app.get("/api/tasks/{task_id}/session-detail/{session}")
-def api_task_session_detail(task_id: str, session: str, eval_qc: Optional[str] = None):
+def api_task_session_detail(task_id: str, session: str, eval_qc: Optional[str] = None,
+                            load_evaluator: Optional[int] = 0):
     task = find_task(task_id)
     if not task:
         return JSONResponse({"found": False, "message": "任务不存在"}, status_code=404)
+
+    if task.get("source_type") == "workspace":
+        assistant = _load_workspace_assistant(session, task["output_dir"])
+        if not assistant:
+            return JSONResponse({"found": False, "message": "未找到该会话的 assistant 轨迹文件"}, status_code=404)
+        result = {"found": True, **assistant}
+        # A: 首轮裁决(log 优先, log 无则回退本地 evaluator 轨迹), 挂在 assistant 上供 verdict 面板复用
+        result["verdict"] = _extract_workspace_verdict(session, task["output_dir"])
+        # B: evaluator 完整轨迹, 仅在前端明确请求时按需拉取(懒加载)
+        if load_evaluator:
+            evaluator = _ensure_workspace_evaluator(task, session)
+            if evaluator is not None:
+                # 把 log 裁决也挂到 evaluator 页, 复用 rubric 面板
+                evaluator["verdict"] = result["verdict"]
+            result["evaluator"] = evaluator
+        return result
 
     assistant = _load_simplified_trajectory(session, task["output_dir"])
     if not assistant:
