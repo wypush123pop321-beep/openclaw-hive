@@ -164,6 +164,7 @@ body{
       <span class="pulse"></span> {{ runningTaskName }} 采集中
     </el-tag>
     <span v-if="jobStatus.running" style="font-size:11px;color:var(--neon-amber);font-family:ui-monospace,monospace">已运行 {{ elapsedSeconds }}s</span>
+    <el-button v-if="jobStatus.running" size="small" type="danger" @click="stopJob">终止采集</el-button>
     <el-button size="small" type="primary" @click="openTaskForm">登记采集任务</el-button>
   </div>
 </div>
@@ -172,7 +173,12 @@ body{
 
   <!-- 全局运行中 / 出错提示 -->
   <el-alert v-if="jobStatus.running" type="warning" show-icon :closable="false" style="margin-bottom:18px">
-    <template #title>「{{ runningTaskName }}」采集中（已运行 {{ elapsedSeconds }}s）</template>
+    <template #title>
+      <div style="display:flex;align-items:center;justify-content:space-between">
+        <span>「{{ runningTaskName }}」采集中（已运行 {{ elapsedSeconds }}s）</span>
+        <el-button size="small" type="danger" @click="stopJob">终止采集</el-button>
+      </div>
+    </template>
     <div class="progress-indet"></div>
     <div class="progress-line" v-if="jobStatus.progress">{{ jobStatus.progress }}</div>
     <el-collapse style="margin-top:8px" v-if="jobStatus.log_tail && jobStatus.log_tail.length">
@@ -203,15 +209,29 @@ body{
 
     <div class="panel">
       <div class="tbl-hdr">
-        <div class="tbl-title">采集任务 <el-tag size="small" type="info">共 {{ tasks.length }} 个</el-tag></div>
+        <div class="tbl-title">采集任务 <el-tag size="small" type="info">共 {{ filteredTasks.length }} 个</el-tag></div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <span style="font-size:12px;color:var(--text-1)">按分组筛选:</span>
+          <el-select v-model="selectedGroup" placeholder="全部任务" clearable size="small" style="width:180px" @change="filterTasksByGroup">
+            <el-option label="全部任务" value=""></el-option>
+            <el-option label="未分组" value="__ungroup__"></el-option>
+            <el-option v-for="g in allGroups" :key="g" :label="g" :value="g"></el-option>
+          </el-select>
+        </div>
       </div>
-      <el-table :data="tasks" size="small" border v-loading="tasksLoading">
+      <el-table :data="filteredTasks" size="small" border v-loading="tasksLoading">
         <el-table-column label="任务名称" min-width="180" show-overflow-tooltip>
           <template #default="{row}">
             <span class="task-name-link" @click="enterTask(row)">{{ row.name }}</span>
             <el-tag size="small" :type="(row.source_type === 'workspace') ? 'warning' : 'info'" style="margin-left:6px">
               {{ (row.source_type === 'workspace') ? 'workspace' : 'session' }}
             </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="分组" width="180" show-overflow-tooltip>
+          <template #default="{row}">
+            <el-tag v-for="g in (row.groups || [])" :key="g" size="small" type="info" style="margin-right:4px">{{ g }}</el-tag>
+            <span v-if="!(row.groups && row.groups.length)" style="color:var(--text-2);font-size:11px">未分组</span>
           </template>
         </el-table-column>
         <el-table-column label="创建时间" width="160" show-overflow-tooltip>
@@ -243,10 +263,11 @@ body{
             <el-tag v-else type="info" size="small">未运行</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="180" align="center">
+        <el-table-column label="操作" width="260" align="center">
           <template #default="{row}">
             <el-button size="small" text :disabled="jobStatus.running" @click="retriggerTask(row)">重新采集</el-button>
             <el-button size="small" text @click="openRenameForm(row)">重命名</el-button>
+            <el-button size="small" text @click="openGroupsForm(row)">编辑分组</el-button>
             <el-popconfirm title="确定删除该任务及其采集到的所有数据吗？此操作不可恢复。" confirm-button-text="删除" cancel-button-text="取消" @confirm="deleteTask(row)">
               <template #reference>
                 <el-button size="small" text type="danger" :disabled="jobStatus.running && jobStatus.task_id === row.id">删除</el-button>
@@ -425,6 +446,23 @@ body{
   </template>
 </el-dialog>
 
+<el-dialog v-model="groupsFormVisible" title="编辑任务分组" width="540px" destroy-on-close>
+  <el-form :model="groupsForm" label-position="top" @submit.prevent>
+    <el-form-item label="分组（可多选或新建）">
+      <el-select v-model="groupsForm.groups" multiple filterable allow-create default-first-option placeholder="选择或输入分组名称" style="width:100%">
+        <el-option v-for="g in allGroups" :key="g" :label="g" :value="g"></el-option>
+      </el-select>
+    </el-form-item>
+    <el-alert title="提示" type="info" :closable="false" show-icon>
+      <div style="font-size:12px">分组用于将任务归类统计。可以选择已有分组，或输入新分组名称后按回车创建。</div>
+    </el-alert>
+  </el-form>
+  <template #footer>
+    <el-button @click="groupsFormVisible = false">取消</el-button>
+    <el-button type="primary" :loading="groupsFormSubmitting" @click="submitGroupsForm">保存</el-button>
+  </template>
+</el-dialog>
+
 <!-- Session Detail Dialog -->
 <el-dialog v-model="detailVisible" title="会话详情" width="720px" destroy-on-close>
   <template v-if="selectedSession">
@@ -552,6 +590,8 @@ createApp({
       tasks: [],
       tasksLoading: false,
       activeTaskId: null,
+      selectedGroup: localStorage.getItem('selectedGroup') || '学习生活',
+      filteredTasks: [],
 
       taskFormVisible: false,
       taskFormSubmitting: false,
@@ -569,6 +609,11 @@ createApp({
       renameFormVisible: false,
       renameFormSubmitting: false,
       renameForm: { taskId: '', name: '' },
+
+      groupsFormVisible: false,
+      groupsFormSubmitting: false,
+      groupsForm: { taskId: '', groups: [] },
+      allGroups: [],
 
       retriggerPasswordVisible: false,
       retriggerPasswordTargets: [],
@@ -648,14 +693,26 @@ createApp({
 
   methods: {
     async loadStats() {
-      try { const r = await axios.get('/api/stats'); this.stats = r.data }
-      catch (e) { console.error('loadStats', e) }
+      try {
+        if (this.selectedGroup) {
+          // 有选中分组时，调用 by-group API
+          const group = this.selectedGroup === '__ungroup__' ? '' : this.selectedGroup
+          const r = await axios.get('/api/stats/by-group', { params: { group } })
+          this.stats = r.data
+        } else {
+          // 无选中分组时，调用全局统计 API
+          const r = await axios.get('/api/stats')
+          this.stats = r.data
+        }
+      } catch (e) { console.error('loadStats', e) }
     },
     async loadTasks() {
       this.tasksLoading = true
       try {
         const r = await axios.get('/api/tasks')
         this.tasks = r.data.tasks
+        await this.loadAllGroups()
+        this.filterTasksByGroup()
       } catch (e) { console.error('loadTasks', e) }
       finally { this.tasksLoading = false }
     },
@@ -797,6 +854,37 @@ createApp({
       }
     },
 
+    async stopJob() {
+      try {
+        await ElementPlus.ElMessageBox.confirm(
+          '确定要终止当前的采集任务吗？已下载的数据将保留，但统计结果可能不完整。',
+          '终止采集',
+          {
+            confirmButtonText: '确定终止',
+            cancelButtonText: '取消',
+            type: 'warning',
+          }
+        )
+      } catch {
+        // 用户取消
+        return
+      }
+
+      try {
+        const r = await axios.post('/api/job-stop')
+        if (r.data.success) {
+          ElementPlus.ElMessage.success('已终止采集任务')
+          this.jobStatus.running = false
+          this.jobStatus.started_at = null
+          await this.loadTasks()
+        } else {
+          ElementPlus.ElMessage.error(r.data.message || '终止失败')
+        }
+      } catch (e) {
+        ElementPlus.ElMessage.error(e.response?.data?.message || '终止失败，请检查后端服务')
+      }
+    },
+
     formatTime(iso) {
       if (!iso) return '—'
       return new Date(iso).toLocaleString('zh-CN')
@@ -827,6 +915,36 @@ createApp({
         this.renameFormSubmitting = false
       }
     },
+    async openGroupsForm(task) {
+      this.groupsForm = { taskId: task.id, groups: [...(task.groups || [])] }
+      await this.loadAllGroups()
+      this.groupsFormVisible = true
+    },
+    async loadAllGroups() {
+      try {
+        const r = await axios.get('/api/groups')
+        this.allGroups = r.data.groups || []
+      } catch (e) {
+        console.error('加载分组列表失败:', e)
+      }
+    },
+    async submitGroupsForm() {
+      this.groupsFormSubmitting = true
+      try {
+        const r = await axios.put(`/api/tasks/${this.groupsForm.taskId}/groups`, { groups: this.groupsForm.groups })
+        if (r.data.success) {
+          ElementPlus.ElMessage.success('分组已更新')
+          this.groupsFormVisible = false
+          await this.loadTasks()
+        } else {
+          ElementPlus.ElMessage.error(r.data.message || '更新失败')
+        }
+      } catch (e) {
+        ElementPlus.ElMessage.error(e.response?.data?.message || '更新失败，请检查后端服务')
+      } finally {
+        this.groupsFormSubmitting = false
+      }
+    },
     async deleteTask(task) {
       try {
         const r = await axios.delete(`/api/tasks/${task.id}`)
@@ -839,6 +957,19 @@ createApp({
       } catch (e) {
         ElementPlus.ElMessage.error(e.response?.data?.message || '删除失败，请检查后端服务')
       }
+    },
+    filterTasksByGroup() {
+      if (!this.selectedGroup) {
+        this.filteredTasks = this.tasks
+      } else if (this.selectedGroup === '__ungroup__') {
+        this.filteredTasks = this.tasks.filter(t => !(t.groups && t.groups.length))
+      } else {
+        this.filteredTasks = this.tasks.filter(t => (t.groups || []).includes(this.selectedGroup))
+      }
+      // 保存选择到 localStorage
+      localStorage.setItem('selectedGroup', this.selectedGroup || '')
+      // 刷新数据总览看板
+      this.loadStats()
     },
 
     enterTask(task) {

@@ -47,6 +47,7 @@ _job_state = {
     "last_duration_seconds": None,
     "last_error": None,
     "last_exit_code": None,
+    "process": None,  # 当前运行的子进程对象
 }
 _LOG_TAIL_MAX = 40
 
@@ -271,6 +272,10 @@ def _stream_subprocess(cmd, env=None):
         text=True, encoding="utf-8", errors="replace", bufsize=1,
         env=env,
     )
+    # 保存进程对象到全局状态，供终止接口使用
+    with _job_lock:
+        _job_state["process"] = proc
+
     buf = ""
     all_output = []
     while True:
@@ -288,6 +293,11 @@ def _stream_subprocess(cmd, env=None):
         _append_log_line(buf)
         all_output.append(buf)
     proc.wait()
+
+    # 清除进程对象
+    with _job_lock:
+        _job_state["process"] = None
+
     return proc.returncode, "\n".join(all_output)
 
 
@@ -404,6 +414,76 @@ def _task_summary(task: dict) -> dict:
 @app.get("/api/tasks")
 def api_list_tasks():
     return {"tasks": [_task_summary(t) for t in load_tasks()]}
+
+
+@app.get("/api/groups")
+def api_list_groups():
+    """列出所有分组名称（从所有任务的 groups 字段去重汇总）。"""
+    tasks = load_tasks()
+    all_groups = set()
+    for t in tasks:
+        for g in (t.get("groups") or []):
+            if isinstance(g, str) and g.strip():
+                all_groups.add(g.strip())
+    return {"groups": sorted(all_groups)}
+
+
+@app.get("/api/stats/by-group")
+def api_stats_by_group(group: Optional[str] = None):
+    """按分组统计轨迹数（漏斗汇总）。
+
+    group=None 或空字符串时，空字符串表示"未分组"；group=<name> 时只统计该组内任务。
+    """
+    tasks = load_tasks()
+    if group is not None:
+        if group == '':
+            # 空字符串 = 未分组
+            tasks = [t for t in tasks if not (t.get("groups") and len(t.get("groups")))]
+        else:
+            # 指定分组
+            tasks = [t for t in tasks if group in (t.get("groups") or [])]
+
+    total = filtered = with_eval = ge05 = eq1 = dropped = session_total = 0
+    for t in tasks:
+        sp = stats_path(t["output_dir"])
+        if not sp.exists():
+            continue
+        with open(sp, encoding="utf-8") as f:
+            data = json.load(f)
+        filtered += data.get("filtered_count", 0)
+        with_eval += data.get("with_eval_count", 0)
+        ge05 += data.get("completion_ge_0.5", 0)
+        eq1 += data.get("completion_eq_1", 0)
+        dropped += data.get("dropped_count", 0)
+        session_total += len(data.get("per_session", []))
+
+    total = filtered + dropped
+    return {
+        "group": group,
+        "task_count": len(tasks),
+        "filtered_count": filtered,
+        "dropped_count": dropped,
+        "with_eval_count": with_eval,
+        "completion_ge_0.5": ge05,
+        "completion_eq_1": eq1,
+        "available": total > 0,
+    }
+
+
+@app.put("/api/tasks/{task_id}/groups")
+def api_update_task_groups(task_id: str, body: dict):
+    """更新任务的分组（覆盖式）。
+
+    body: {"groups": ["组1", "组2", ...]}
+    """
+    groups = body.get("groups") or []
+    if not isinstance(groups, list):
+        return JSONResponse({"success": False, "message": "groups 必须是数组"}, status_code=400)
+    # 去重、去空、trim
+    groups = sorted(set(g.strip() for g in groups if isinstance(g, str) and g.strip()))
+
+    update_task(task_id, groups=groups)
+    return {"success": True, "groups": groups}
 
 
 def _extract_ssh_passwords(body: dict) -> dict:
@@ -778,16 +858,18 @@ def _workspace_task_dir(session: str, output_dir: str) -> Optional[Path]:
 
 
 def _load_workspace_assistant(session: str, output_dir: str) -> Optional[dict]:
-    """加载 workspace assistant 轨迹: <task>/agents/assistant*/sessions/<非trajectory>.jsonl。"""
+    """加载 workspace assistant 轨迹: <task>/agents/{assistant*,main}/sessions/<非trajectory>.jsonl。
+    assistant 侧目录名可能是 assistant1 或 main(不同 harness 变体)。"""
     task_dir = _workspace_task_dir(session, output_dir)
     if not task_dir:
         return None
-    for jsonl in sorted(task_dir.glob("agents/assistant*/sessions/*.jsonl")):
-        if "trajectory" in jsonl.name:
-            continue
-        traj = _load_workspace_jsonl_trajectory(jsonl, session)
-        if traj:
-            return traj
+    for pattern in ("agents/assistant*/sessions/*.jsonl", "agents/main/sessions/*.jsonl"):
+        for jsonl in sorted(task_dir.glob(pattern)):
+            if "trajectory" in jsonl.name:
+                continue
+            traj = _load_workspace_jsonl_trajectory(jsonl, session)
+            if traj:
+                return traj
     return None
 
 
@@ -965,6 +1047,98 @@ def _ensure_workspace_evaluator(task: dict, session: str) -> Optional[dict]:
     return _load_workspace_jsonl_trajectory(jsonl, session)
 
 
+# ── Hermes 来源(query1.json): 轨迹+评测同在一个文件, 无 agents/*/sessions ────────
+
+def _find_query1_json(session: str, output_dir: str) -> Optional[Path]:
+    """定位 Hermes 的 query1.json: <output_dir>/origin/<session>/logs/trajectories/*/query*.json。
+    多时间戳目录时取最大者(与统计侧一致)。"""
+    task_dir = _workspace_task_dir(session, output_dir)
+    if not task_dir:
+        return None
+    cands = sorted(task_dir.glob("logs/trajectories/*/query*.json"),
+                   key=lambda p: p.stat().st_size, reverse=True)
+    return cands[0] if cands else None
+
+
+def _render_query1_trajectory(query1_path: Path, session: str) -> Optional[dict]:
+    """把 query1.json 的 turns[] 渲染成前端已认的 {role, content, ...} 消息流:
+       每个 turn -> user(user_input) + assistant(agent_content + tool_calls)。"""
+    try:
+        with open(query1_path, encoding="utf-8", errors="replace") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+    messages = []
+    for t in (data.get("turns") or []):
+        if not isinstance(t, dict):
+            continue
+        ui = (t.get("user_input") or "").strip()
+        if ui:
+            txt, trunc = ui, False
+            if len(txt) > _MAX_MSG_CHARS:
+                txt, trunc = txt[:_MAX_MSG_CHARS], True
+            messages.append({"role": "user", "content": txt, "truncated": trunc})
+
+        ac = t.get("agent_content") or ""
+        tool_calls = []
+        for tc in (t.get("tool_calls") or []):
+            if not isinstance(tc, dict):
+                continue
+            tool_calls.append({
+                "name": tc.get("tool"),
+                # 复用 openclaw 的 arguments 字段, 前端已能渲染
+                "arguments": tc.get("input"),
+                "output": tc.get("output"),
+            })
+        txt, trunc = ac, False
+        if len(txt) > _MAX_MSG_CHARS:
+            txt, trunc = txt[:_MAX_MSG_CHARS], True
+        msg = {"role": "assistant", "content": txt, "truncated": trunc}
+        if tool_calls:
+            msg["tool_calls"] = tool_calls
+        if msg["content"] or tool_calls:
+            messages.append(msg)
+
+    return {
+        "session": session,
+        "source_file": str(query1_path),
+        "model": data.get("agent_name"),
+        "message_count": len(messages),
+        "messages": messages,
+    }
+
+
+def _query1_verdict(query1_path: Path) -> Optional[dict]:
+    """从 query1.json.evaluations[] 首轮(turn 号最小)构造 verdict, 归一化成 rubric 面板结构。"""
+    try:
+        with open(query1_path, encoding="utf-8", errors="replace") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+    evals = [e for e in (data.get("evaluations") or []) if isinstance(e, dict)]
+    if not evals:
+        return None
+    obj = min(evals, key=lambda e: e.get("turn", float("inf")))
+    gate_status = obj.get("gate_status") if isinstance(obj.get("gate_status"), dict) else {}
+    rubric_checks = _sort_rubric_gate_first([
+        {
+            "kind": "gate" if rc.get("rubric_id") in gate_status else "reward",
+            "criterion": rc.get("criterion"),
+            "passed": rc.get("passed"),
+            "evidence": rc.get("evidence"),
+        }
+        for rc in (obj.get("rubric_checks") or []) if isinstance(rc, dict)
+    ])
+    return {
+        "completion": obj.get("completion"),
+        "reason": obj.get("reason"),
+        "inclination": obj.get("inclination"),
+        "rubric_checks": rubric_checks,
+        "verdict_source": "query1",
+    }
+
+
 @app.get("/api/tasks/{task_id}/session-detail/{session}")
 def api_task_session_detail(task_id: str, session: str, eval_qc: Optional[str] = None,
                             load_evaluator: Optional[int] = 0):
@@ -974,18 +1148,31 @@ def api_task_session_detail(task_id: str, session: str, eval_qc: Optional[str] =
 
     if task.get("source_type") == "workspace":
         assistant = _load_workspace_assistant(session, task["output_dir"])
-        if not assistant:
+        if assistant:
+            # openclaw: 有 agents/*/sessions 事件流
+            result = {"found": True, **assistant}
+            # A: 首轮裁决(log 优先, log 无则回退本地 evaluator 轨迹), 挂在 assistant 上供 verdict 面板复用
+            result["verdict"] = _extract_workspace_verdict(session, task["output_dir"])
+            # B: evaluator 完整轨迹, 仅在前端明确请求时按需拉取(懒加载)
+            if load_evaluator:
+                evaluator = _ensure_workspace_evaluator(task, session)
+                if evaluator is not None:
+                    # 把 log 裁决也挂到 evaluator 页, 复用 rubric 面板
+                    evaluator["verdict"] = result["verdict"]
+                result["evaluator"] = evaluator
+            return result
+
+        # Hermes: 无 sessions jsonl, 轨迹+评测都在 query1.json 里
+        query1 = _find_query1_json(session, task["output_dir"])
+        if not query1:
             return JSONResponse({"found": False, "message": "未找到该会话的 assistant 轨迹文件"}, status_code=404)
-        result = {"found": True, **assistant}
-        # A: 首轮裁决(log 优先, log 无则回退本地 evaluator 轨迹), 挂在 assistant 上供 verdict 面板复用
-        result["verdict"] = _extract_workspace_verdict(session, task["output_dir"])
-        # B: evaluator 完整轨迹, 仅在前端明确请求时按需拉取(懒加载)
-        if load_evaluator:
-            evaluator = _ensure_workspace_evaluator(task, session)
-            if evaluator is not None:
-                # 把 log 裁决也挂到 evaluator 页, 复用 rubric 面板
-                evaluator["verdict"] = result["verdict"]
-            result["evaluator"] = evaluator
+        traj = _render_query1_trajectory(query1, session)
+        if not traj:
+            return JSONResponse({"found": False, "message": "query1.json 解析失败"}, status_code=404)
+        result = {"found": True, **traj}
+        result["verdict"] = _query1_verdict(query1)
+        # Hermes 评测就在 query1.json 里, 无独立 evaluator 轨迹
+        result["evaluator"] = None
         return result
 
     assistant = _load_simplified_trajectory(session, task["output_dir"])
@@ -1006,7 +1193,44 @@ def api_job_status():
     with _job_lock:
         snap = dict(_job_state)
         snap["log_tail"] = list(_job_state["log_tail"])
+        # 不暴露进程对象到API响应
+        snap.pop("process", None)
         return snap
+
+
+@app.post("/api/job-stop")
+def api_job_stop():
+    """终止当前正在运行的采集任务"""
+    with _job_lock:
+        if not _job_state["running"]:
+            return {"success": False, "message": "当前没有正在运行的采集任务"}
+        proc = _job_state["process"]
+        task_id = _job_state["task_id"]
+
+    if proc is None:
+        return {"success": False, "message": "无法获取进程对象"}
+
+    try:
+        # 尝试优雅终止
+        proc.terminate()
+        # 等待最多5秒
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            # 强制杀死
+            proc.kill()
+            proc.wait()
+
+        with _job_lock:
+            _job_state["running"] = False
+            _job_state["started_at"] = None
+            _job_state["last_error"] = "用户手动终止"
+            _job_state["last_exit_code"] = -1
+            _job_state["process"] = None
+
+        return {"success": True, "message": f"已终止采集任务", "task_id": task_id}
+    except Exception as e:
+        return {"success": False, "message": f"终止失败: {str(e)}"}
 
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
