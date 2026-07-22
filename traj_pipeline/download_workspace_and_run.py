@@ -69,7 +69,8 @@ INCLUDE_PATTERNS = ["*assistant*sessions*.jsonl", "*agents/main/sessions/*.jsonl
                     "*logs*.log", "*evaluator*sessions*.jsonl",
                     "*logs/trajectories/*query*.json",
                     "*profiles/assistant*/sessions/*.json",
-                    "*profiles/main/sessions/*.json"]
+                    "*profiles/main/sessions/*.json",
+                    "*profiles/assistant*/state.db*"]
 # 宽泛的 *logs*.log include 会连带匹配一些噪音日志, 逐条 exclude 挡掉(统计/详情都不读):
 #   - *profiles/*/logs/*  : Hermes 的 profiles/assistant1/logs/agent.log、errors.log
 #   - *_logs/*.log        : npm 调试日志 profiles/*/home/.npm/_logs/*-debug-0.log

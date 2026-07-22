@@ -3,6 +3,7 @@ import io
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import tarfile
@@ -814,6 +815,11 @@ def _load_workspace_jsonl_trajectory(jsonl_path: Path, session: str) -> Optional
         return None
     messages = []
     model = None
+    # 统计 token 使用量 (仅统计 assistant 的 usage)
+    total_input_tokens = 0
+    total_output_tokens = 0
+    total_reasoning_tokens = 0
+
     with open(jsonl_path, encoding="utf-8", errors="replace") as f:
         for line in f:
             line = line.strip()
@@ -832,6 +838,15 @@ def _load_workspace_jsonl_trajectory(jsonl_path: Path, session: str) -> Optional
             msg = obj.get("message") or {}
             role = msg.get("role")
             content = msg.get("content")
+
+            # 提取 usage 信息 (仅 assistant 消息有 usage)
+            if role == "assistant":
+                usage = msg.get("usage")
+                if usage and isinstance(usage, dict):
+                    total_input_tokens += usage.get("input", 0)
+                    total_output_tokens += usage.get("output", 0)
+                    total_reasoning_tokens += usage.get("reasoningTokens", 0)
+
             if isinstance(content, str):
                 text = content
                 truncated = False
@@ -843,13 +858,25 @@ def _load_workspace_jsonl_trajectory(jsonl_path: Path, session: str) -> Optional
                 simplified = _simplify_workspace_message(role, content)
                 if simplified:
                     messages.append(simplified)
-    return {
+
+    result = {
         "session": session,
         "source_file": str(jsonl_path),
         "model": model,
         "message_count": len(messages),
         "messages": messages,
     }
+
+    # 添加 token 统计信息
+    if total_input_tokens > 0 or total_output_tokens > 0:
+        result["token_usage"] = {
+            "input_tokens": total_input_tokens,
+            "output_tokens": total_output_tokens,
+            "reasoning_tokens": total_reasoning_tokens,
+            "total_tokens": total_input_tokens + total_output_tokens,
+        }
+
+    return result
 
 
 def _workspace_task_dir(session: str, output_dir: str) -> Optional[Path]:
@@ -1201,6 +1228,37 @@ def _query1_verdict(query1_path: Path) -> Optional[dict]:
     }
 
 
+def _read_hermes_state_db(task_dir: Path) -> Optional[dict]:
+    """从 Hermes 的 profiles/assistant1/state.db 读取 token 使用量。
+    task_dir 是 <output_dir>/origin/<task_name>/。
+    返回 {input_tokens, output_tokens, reasoning_tokens, total_tokens}。"""
+    state_db = task_dir / "profiles" / "assistant1" / "state.db"
+    if not state_db.exists():
+        return None
+    try:
+        con = sqlite3.connect(str(state_db))
+        con.row_factory = sqlite3.Row
+        # 每个 Hermes task 只有一个 session, 取第一条即可
+        row = con.execute(
+            "SELECT input_tokens, output_tokens, reasoning_tokens "
+            "FROM sessions LIMIT 1"
+        ).fetchone()
+        con.close()
+        if not row:
+            return None
+        inp = row["input_tokens"] or 0
+        out = row["output_tokens"] or 0
+        reas = row["reasoning_tokens"] or 0
+        return {
+            "input_tokens": inp,
+            "output_tokens": out,
+            "reasoning_tokens": reas,
+            "total_tokens": inp + out,
+        }
+    except Exception:
+        return None
+
+
 @app.get("/api/tasks/{task_id}/session-detail/{session}")
 def api_task_session_detail(task_id: str, session: str, eval_qc: Optional[str] = None,
                             load_evaluator: Optional[int] = 0):
@@ -1233,6 +1291,12 @@ def api_task_session_detail(task_id: str, session: str, eval_qc: Optional[str] =
             return JSONResponse({"found": False, "message": "query1.json 解析失败"}, status_code=404)
         result = {"found": True, **traj}
         result["verdict"] = _query1_verdict(query1)
+        # 从 state.db 读取 Hermes assistant 的 token 使用量
+        task_dir = _workspace_task_dir(session, task["output_dir"])
+        if task_dir:
+            token_info = _read_hermes_state_db(task_dir)
+            if token_info:
+                result["token_usage"] = token_info
         # 裁决(rubric/completion)在 query1.json 里, 已挂到 verdict 面板。
         # evaluator 完整轨迹是独立的 profiles/evaluator/sessions/*.json, 默认不随批量下载,
         # 仅在前端明确请求(load_evaluator)时按需拉取(懒加载)。

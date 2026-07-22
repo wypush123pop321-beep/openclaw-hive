@@ -247,11 +247,14 @@ body{
             </span>
           </template>
         </el-table-column>
-        <el-table-column label="L0/L1/L1.5/L2/L3" width="180" align="center">
+        <el-table-column v-for="col in levelColumns" :key="col.label" :label="col.label" width="72" align="center">
           <template #default="{row}">
-            <span v-if="row.available" style="font-family:ui-monospace,monospace;font-size:12px">
-              {{ (row.filtered_count || 0) + (row.dropped_count || 0) }}/{{ row.filtered_count }}/{{ row.with_eval_count }}/{{ row['completion_ge_0.5'] }}/{{ row.completion_eq_1 }}
-            </span>
+            <template v-if="row.available">
+              <div style="font-family:ui-monospace,monospace;font-size:12px;line-height:1.6">
+                <div>{{ levelCount(col.idx, row) }}</div>
+                <div v-if="l0HasData(row)" style="font-size:10px;color:var(--text-1)">{{ pct(col.idx, row) }}</div>
+              </div>
+            </template>
             <span v-else style="color:var(--text-2)">—</span>
           </template>
         </el-table-column>
@@ -484,6 +487,14 @@ body{
         </template>
         <span v-else style="color:var(--text-2)">无</span>
       </el-descriptions-item>
+      <el-descriptions-item v-if="trajLoaded && currentTrajTokens" label="Token 使用量">
+        <div style="font-family:ui-monospace,monospace;font-size:12px;color:var(--text-0);display:flex;gap:16px;flex-wrap:wrap">
+          <span><strong style="color:var(--neon-cyan)">Input:</strong> {{ currentTrajTokens.input_tokens.toLocaleString() }}</span>
+          <span><strong style="color:var(--neon-green)">Output:</strong> {{ currentTrajTokens.output_tokens.toLocaleString() }}</span>
+          <span v-if="currentTrajTokens.reasoning_tokens > 0"><strong style="color:var(--neon-purple)">Reasoning:</strong> {{ currentTrajTokens.reasoning_tokens.toLocaleString() }}</span>
+          <span><strong style="color:var(--neon-amber)">Total:</strong> {{ currentTrajTokens.total_tokens.toLocaleString() }}</span>
+        </div>
+      </el-descriptions-item>
       <el-descriptions-item v-if="!isWorkspaceTask" label="Eval QC Trace ID">
         <span style="font-family:ui-monospace,monospace;font-size:12px;color:var(--text-1)">{{ selectedSession.eval_qc || '—' }}</span>
       </el-descriptions-item>
@@ -668,6 +679,11 @@ createApp({
       if (this.trajTab === 'evaluator') return this.trajData.evaluator || null
       return this.trajData
     },
+    currentTrajTokens() {
+      // 根据当前 tab 返回对应轨迹的 token 信息
+      const traj = this.activeTrajData
+      return traj && traj.token_usage ? traj.token_usage : null
+    },
     evalVerdict() {
       // workspace: 裁决来自 log, 挂在 trajData.verdict(A 部分, 无需等 evaluator 轨迹);
       // session_analysis: 挂在 trajData.evaluator.verdict
@@ -690,9 +706,37 @@ createApp({
           tip: 'evaluator 给出的 completion 分数 = 1 的轨迹数，即完全达成任务的最高质量轨迹' },
       ]
     },
+    levelColumns() {
+      return [
+        { label: 'L0', idx: 0 },
+        { label: 'L1', idx: 1 },
+        { label: 'L1.5', idx: 2 },
+        { label: 'L2', idx: 3 },
+        { label: 'L3', idx: 4 },
+      ]
+    },
   },
 
   methods: {
+    levelCount(idx, row) {
+      const counts = [
+        (row.filtered_count || 0) + (row.dropped_count || 0),
+        row.filtered_count || 0,
+        row.with_eval_count || 0,
+        row['completion_ge_0.5'] || 0,
+        row.completion_eq_1 || 0,
+      ]
+      return counts[idx]
+    },
+    l0HasData(row) {
+      return ((row.filtered_count || 0) + (row.dropped_count || 0)) > 0
+    },
+    pct(idx, row) {
+      const l0 = this.levelCount(0, row)
+      if (!l0) return ''
+      const v = this.levelCount(idx, row)
+      return Math.round(v / l0 * 100) + '%'
+    },
     async loadStats() {
       try {
         if (this.selectedGroup) {
