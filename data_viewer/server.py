@@ -29,6 +29,7 @@ STATIC_DIR = HERE / "static"
 sys.path.insert(0, str(HERE.parent))
 import traj_stats  # noqa: E402
 CONFIG_FILE = HERE / "config.json"
+OBS_PROFILES_FILE = HERE / "obs_profiles.json"  # 额外 OBS 账号/桶凭证, gitignored, 不提交
 TASKS_FILE = HERE / "tasks.json"
 STATS_FILE_NAME = "filter_stats.json"
 
@@ -38,7 +39,41 @@ DEFAULT_CONFIG = {
     "port": 8080,
 }
 
-STAT_SUM_KEYS = ["filtered_count", "with_eval_count", "completion_ge_0.5", "completion_eq_1", "dropped_count"]
+def _merge_tier_stats(stats_list, avg_key):
+    """跨任务合并按 tier 聚合的统计（token_stats / char_len_stats 共用）。
+
+    stats_list: 每个元素是一个 dict 的 token_stats 或 char_len_stats 字段（可能为 None），
+                其内部各 tier 结构为 {sum_total, count, ...}。
+    avg_key: 结果里平均值字段名（"avg_total_tokens" 或 "avg_char_len"）。
+    返回合并后的 {L0: {<avg_key>: ...}, L1: {...}, ...}，若无数据返回 None。
+    """
+    tiers = ("L0", "L1", "T_DONE", "L1.5", "L2", "L3")
+    merged = {}
+    for tier in tiers:
+        sum_t = 0
+        cnt = 0
+        for ts in stats_list:
+            if not ts or tier not in ts:
+                continue
+            t = ts[tier]
+            sum_t += t.get("sum_total", 0)
+            cnt += t.get("count", 0)
+        if cnt == 0:
+            continue
+        merged[tier] = {avg_key: round(sum_t / cnt)}
+    return merged if merged else None
+
+
+def _merge_token_stats(stats_list):
+    return _merge_tier_stats(stats_list, "avg_total_tokens")
+
+
+def _merge_char_len_stats(stats_list):
+    return _merge_tier_stats(stats_list, "avg_char_len")
+
+
+STAT_SUM_KEYS = ["filtered_count", "with_eval_count", "completion_ge_0.5", "completion_eq_1", "dropped_count",
+                 "task_done_count"]
 
 _job_lock = threading.Lock()
 _job_state = {
@@ -66,6 +101,41 @@ def load_config() -> dict:
             cfg.setdefault(k, v)
         return cfg
     return DEFAULT_CONFIG.copy()
+
+
+def load_obs_profiles() -> dict:
+    """读取额外 OBS 账号/桶的凭证(AK/SK/endpoint), 按 profile 名字索引。
+
+    存在 OBS_PROFILES_FILE(gitignored, 不提交)里, 不存在则返回空——所有 task 都走
+    obsutil 全局默认凭证(现有行为, 零影响)。"""
+    if OBS_PROFILES_FILE.exists():
+        with open(OBS_PROFILES_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def _obs_cred_args_for_task(task: dict) -> list:
+    """task 指定了非 default 的 obs_profile 时, 返回覆盖 obsutil 全局默认凭证的
+    ["-i", ak, "-k", sk, "-e", endpoint]; 否则返回 [](走全局默认, 现有桶零影响)。"""
+    profile_name = task.get("obs_profile") or "default"
+    if profile_name == "default":
+        return []
+    profile = load_obs_profiles().get(profile_name)
+    if not profile:
+        return []
+    return ["-i", profile["ak"], "-k", profile["sk"], "-e", profile["endpoint"]]
+
+
+def _obs_cli_flags_for_task(task: dict) -> list:
+    """同 _obs_cred_args_for_task, 但用于调用 traj_pipeline 子脚本(它们接的是
+    --obs-ak/--obs-sk/--obs-endpoint, 自己再转成 obsutil 的 -i/-k/-e)。"""
+    profile_name = task.get("obs_profile") or "default"
+    if profile_name == "default":
+        return []
+    profile = load_obs_profiles().get(profile_name)
+    if not profile:
+        return []
+    return ["--obs-ak", profile["ak"], "--obs-sk", profile["sk"], "--obs-endpoint", profile["endpoint"]]
 
 
 # ── 任务注册表 ────────────────────────────────────────────────────────────────
@@ -338,7 +408,12 @@ def run_pipeline(task_id: str, ssh_passwords: Optional[dict] = None):
                 out_dir,
                 "--obsutil", cfg["obsutil_path"],
                 "--concurrency", str(task.get("concurrency", 8)),
-            ]
+            ] + _obs_cli_flags_for_task(task)
+            # Hermes harness 自动加 --hermes 开关，使用 Hermes 专用 include/exclude
+            name_lower = (task.get("name") or "").lower()
+            obs_lower = (task.get("workspace_obs") or "").lower()
+            if "hermes" in name_lower or "hermes" in obs_lower:
+                cmd.append("--hermes")
         else:
             cmd = [
                 sys.executable,
@@ -348,8 +423,15 @@ def run_pipeline(task_id: str, ssh_passwords: Optional[dict] = None):
                 task["evaluator_obs"],
                 out_dir,
                 "--obsutil", cfg["obsutil_path"],
-            ]
+            ] + _obs_cli_flags_for_task(task)
         proc_env = dict(os.environ)
+        # obsutil 默认读大写 HTTP_PROXY/HTTPS_PROXY, 但环境中它们可能指向被 Docker 网段
+        # 冲突拦住的内网代理(proxycn-spl, 172.19.177.155), 导致 "no route to host"。
+        # 用小写版的正确值覆盖(proxysg-spl, 172.29.14.129, 能通)。
+        if "http_proxy" in proc_env:
+            proc_env["HTTP_PROXY"] = proc_env["http_proxy"]
+        if "https_proxy" in proc_env:
+            proc_env["HTTPS_PROXY"] = proc_env["https_proxy"]
         if ssh_passwords:
             if ssh_passwords.get("assistant"):
                 proc_env["SSH_PASSWORD_ASSISTANT"] = ssh_passwords["assistant"]
@@ -395,6 +477,192 @@ app = FastAPI(title="Trajectory Viewer")
 @app.on_event("startup")
 def _startup():
     migrate_legacy_task_if_needed()
+    # 后台异步回填旧任务的 token_stats / task_done_count，避免阻塞 startup
+    threading.Thread(target=_backfill_token_stats, daemon=True).start()
+    threading.Thread(target=_backfill_task_done, daemon=True).start()
+
+
+def _backfill_token_stats():
+    """启动时回填旧任务的 token_stats/char_len_stats（新任务在 pipeline 阶段已写入）。
+
+    遍历所有已有 filter_stats.json 但缺 token_stats 或 char_len_stats 的任务，对 origin
+    目录重新调用 traj_stats.process_root() 提取 token/char_len 数据，计算各 tier 平均值后写回。
+    """
+    tasks = load_tasks()
+    updated = 0
+    for t in tasks:
+        sp = stats_path(t["output_dir"])
+        if not sp.exists():
+            continue
+        try:
+            with open(sp, encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+        if data.get("token_stats") and data.get("char_len_stats"):
+            continue                # 均已有, 跳过
+
+        origin = origin_dir(t["output_dir"])
+        if not origin.is_dir():
+            continue
+
+        # 跑 traj_stats 提取 token/char_len
+        per_task = traj_stats.process_root(str(origin))
+        if not per_task:
+            continue
+
+        # 同 build_platform_stats 的 tier 聚合逻辑
+        l0_idx, l1_idx, l15_idx, l2_idx, l3_idx, td_idx = [], [], [], [], [], []
+        for i, row in enumerate(per_task):
+            comp = row.get("evaluator_completion")
+            has_score = isinstance(comp, (int, float))
+            passed = bool(row.get("passed_gate"))
+            if bool(row.get("task_done")):
+                td_idx.append(i)
+            if passed:
+                l1_idx.append(i)
+                if has_score:
+                    l15_idx.append(i)
+                if has_score and isinstance(comp, (int, float)) and comp >= 0.5:
+                    l2_idx.append(i)
+                if has_score and comp == 1:
+                    l3_idx.append(i)
+            l0_idx.append(i)
+
+        def _avg(entries, indices, field, avg_key):
+            sum_total = 0
+            cnt = 0
+            for idx in indices:
+                row = entries[idx]
+                total = row.get(field)
+                if total is None:
+                    continue
+                sum_total += total
+                cnt += 1
+            if cnt == 0:
+                return None
+            return {"sum_total": sum_total, "count": cnt,
+                    avg_key: round(sum_total / cnt)}
+
+        token_stats = {}
+        char_len_stats = {}
+        for tier, indices in [("L0", l0_idx), ("L1", l1_idx), ("T_DONE", td_idx),
+                              ("L1.5", l15_idx), ("L2", l2_idx), ("L3", l3_idx)]:
+            avg = _avg(per_task, indices, "total_tokens", "avg_total_tokens")
+            if avg is not None:
+                token_stats[tier] = avg
+            char_avg = _avg(per_task, indices, "char_len", "avg_char_len")
+            if char_avg is not None:
+                char_len_stats[tier] = char_avg
+
+        if not token_stats and not char_len_stats:
+            continue
+
+        # 写入前重新读取，避免与 _backfill_task_done 并行写入时覆盖对方数据
+        try:
+            with open(sp, encoding="utf-8") as f:
+                latest = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            latest = data
+        if token_stats:
+            latest["token_stats"] = token_stats
+        if char_len_stats:
+            latest["char_len_stats"] = char_len_stats
+        try:
+            with open(sp, "w", encoding="utf-8") as f:
+                json.dump(latest, f, ensure_ascii=False, indent=2)
+            updated += 1
+            print(f"[backfill] token_stats/char_len_stats -> {t.get('name', '?')}")
+        except OSError:
+            pass
+
+    if updated:
+        print(f"[backfill] 共回填 {updated} 个任务的 token_stats/char_len_stats")
+
+
+def _backfill_task_done():
+    """启动时回填旧任务(filter_stats.json 缺 task_done_count)的【Task_Done】统计。
+
+    workspace 来源的任务里 per_session[].session 就是 origin 下的 task 目录名, 可直接定位
+    <session>/logs/<session>.log 检查「【Task_Done】」标记；session_analysis 来源没有这个目录
+    结构, 对应 log 路径必然不存在, has_task_done_marker 会自然返回 False(计数恒为 0)。
+    """
+    tasks = load_tasks()
+    updated = 0
+    for t in tasks:
+        sp = stats_path(t["output_dir"])
+        if not sp.exists():
+            continue
+        try:
+            with open(sp, encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+        if "task_done_count" in data:
+            continue                # 已回填过, 跳过
+
+        sessions = data.get("per_session", [])
+        if not sessions:
+            continue
+
+        origin = origin_dir(t["output_dir"])
+        count = 0
+        td_sum_char = 0
+        td_cnt_char = 0
+        td_sum_tk = 0
+        td_cnt_tk = 0
+        for row in sessions:
+            session = row.get("session")
+            if not session or "/" in session or ".." in session:
+                row["task_done"] = False
+                continue
+            logs_dir = origin / session / "logs"
+            done = traj_stats.check_task_done_in_logs_dir(str(logs_dir), session)
+            row["task_done"] = done
+            if done:
+                count += 1
+                cl = row.get("char_len")
+                if isinstance(cl, (int, float)) and cl > 0:
+                    td_sum_char += cl
+                    td_cnt_char += 1
+                tk = row.get("total_tokens")
+                if isinstance(tk, (int, float)) and tk > 0:
+                    td_sum_tk += tk
+                    td_cnt_tk += 1
+
+        # 写入前重新读取，避免与 _backfill_token_stats 并行写入时覆盖对方数据
+        try:
+            with open(sp, encoding="utf-8") as f:
+                latest = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            latest = data
+        latest["task_done_count"] = count
+        # 也回填 per_session 里 task_done
+        for ls, row in zip(latest.get("per_session", []), sessions):
+            ls["task_done"] = row.get("task_done", False)
+        if td_cnt_tk:
+            ts_td = latest.setdefault("token_stats", {})
+            ts_td["T_DONE"] = {
+                "avg_total_tokens": round(td_sum_tk / td_cnt_tk),
+                "sum_total": td_sum_tk, "count": td_cnt_tk,
+            }
+        if td_cnt_char:
+            cs_td = latest.setdefault("char_len_stats", {})
+            cs_td["T_DONE"] = {
+                "avg_char_len": round(td_sum_char / td_cnt_char),
+                "sum_total": td_sum_char, "count": td_cnt_char,
+            }
+        data = latest
+        try:
+            with open(sp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            updated += 1
+            print(f"[backfill] task_done_count={count} -> {t.get('name', '?')}")
+        except OSError:
+            pass
+
+    if updated:
+        print(f"[backfill] 共回填 {updated} 个任务的 task_done_count")
 
 
 def _task_summary(task: dict) -> dict:
@@ -407,6 +675,10 @@ def _task_summary(task: dict) -> dict:
         summary["session_total"] = len(data.get("per_session", []))
         for k in STAT_SUM_KEYS:
             summary[k] = data.get(k, 0)
+        if data.get("token_stats"):
+            summary["token_stats"] = data["token_stats"]
+        if data.get("char_len_stats"):
+            summary["char_len_stats"] = data["char_len_stats"]
     else:
         summary["available"] = False
         summary["session_total"] = 0
@@ -418,6 +690,12 @@ def _task_summary(task: dict) -> dict:
 @app.get("/api/tasks")
 def api_list_tasks():
     return {"tasks": [_task_summary(t) for t in load_tasks()]}
+
+
+@app.get("/api/obs-profiles")
+def api_list_obs_profiles():
+    """给前端建任务表单用的下拉选项, 只给 profile 名字, 绝不把 ak/sk 传到前端。"""
+    return {"profiles": ["default"] + sorted(load_obs_profiles().keys())}
 
 
 @app.get("/api/groups")
@@ -447,7 +725,9 @@ def api_stats_by_group(group: Optional[str] = None):
             # 指定分组
             tasks = [t for t in tasks if group in (t.get("groups") or [])]
 
-    total = filtered = with_eval = ge05 = eq1 = dropped = session_total = 0
+    total = filtered = with_eval = ge05 = eq1 = dropped = session_total = task_done = 0
+    token_stats_list = []
+    char_len_stats_list = []
     for t in tasks:
         sp = stats_path(t["output_dir"])
         if not sp.exists():
@@ -459,10 +739,15 @@ def api_stats_by_group(group: Optional[str] = None):
         ge05 += data.get("completion_ge_0.5", 0)
         eq1 += data.get("completion_eq_1", 0)
         dropped += data.get("dropped_count", 0)
+        task_done += data.get("task_done_count", 0)
         session_total += len(data.get("per_session", []))
+        if data.get("token_stats"):
+            token_stats_list.append(data["token_stats"])
+        if data.get("char_len_stats"):
+            char_len_stats_list.append(data["char_len_stats"])
 
     total = filtered + dropped
-    return {
+    result = {
         "group": group,
         "task_count": len(tasks),
         "filtered_count": filtered,
@@ -470,8 +755,16 @@ def api_stats_by_group(group: Optional[str] = None):
         "with_eval_count": with_eval,
         "completion_ge_0.5": ge05,
         "completion_eq_1": eq1,
+        "task_done_count": task_done,
         "available": total > 0,
     }
+    merged = _merge_token_stats(token_stats_list)
+    if merged:
+        result["token_stats"] = merged
+    char_merged = _merge_char_len_stats(char_len_stats_list)
+    if char_merged:
+        result["char_len_stats"] = char_merged
+    return result
 
 
 @app.put("/api/tasks/{task_id}/groups")
@@ -516,6 +809,7 @@ def api_create_task(body: dict):
     workspace_obs = (body.get("workspace_obs") or "").strip()
     assistant_obs = (body.get("assistant_obs") or "").strip()
     evaluator_obs = (body.get("evaluator_obs") or "").strip()
+    obs_profile = (body.get("obs_profile") or "default").strip() or "default"
 
     # workspace 下载并发数: 缺省 8, 限制在 [1, 64] 防止误填导致 OBS 限流/进程过多
     try:
@@ -555,6 +849,7 @@ def api_create_task(body: dict):
         "name": name,
         "source_type": source_type,
         "workspace_obs": workspace_obs,
+        "obs_profile": obs_profile,
         "concurrency": concurrency,
         "assistant_obs": assistant_obs,
         "evaluator_obs": evaluator_obs,
@@ -643,6 +938,8 @@ def api_stats():
     summary = {k: 0 for k in STAT_SUM_KEYS}
     session_total = 0
     available = False
+    token_stats_list = []
+    char_len_stats_list = []
     for t in tasks:
         p = stats_path(t["output_dir"])
         if not p.exists():
@@ -653,10 +950,20 @@ def api_stats():
         session_total += len(data.get("per_session", []))
         for k in STAT_SUM_KEYS:
             summary[k] += data.get(k, 0)
+        if data.get("token_stats"):
+            token_stats_list.append(data["token_stats"])
+        if data.get("char_len_stats"):
+            char_len_stats_list.append(data["char_len_stats"])
 
     summary["available"] = available
     summary["session_total"] = session_total
     summary["task_count"] = len(tasks)
+    merged = _merge_token_stats(token_stats_list)
+    if merged:
+        summary["token_stats"] = merged
+    char_merged = _merge_char_len_stats(char_len_stats_list)
+    if char_merged:
+        summary["char_len_stats"] = char_merged
     return summary
 
 
@@ -1065,7 +1372,7 @@ def _ensure_workspace_evaluator(task: dict, session: str) -> Optional[dict]:
             cfg["obsutil_path"], "cp", task_obs, origin, "-r", "-f",
             "-include", "*evaluator*sessions*.jsonl",
             "-exclude", "*trajectory*",
-        ]
+        ] + _obs_cred_args_for_task(task)
         try:
             subprocess.run(cmd, capture_output=True, text=True,
                            encoding="utf-8", errors="replace", timeout=120)
@@ -1126,7 +1433,7 @@ def _ensure_hermes_evaluator(task: dict, session: str) -> Optional[dict]:
         cmd = [
             cfg["obsutil_path"], "cp", task_obs, origin, "-r", "-f",
             "-include", "*profiles/evaluator/sessions/*.json",
-        ]
+        ] + _obs_cred_args_for_task(task)
         try:
             subprocess.run(cmd, capture_output=True, text=True,
                            encoding="utf-8", errors="replace", timeout=120)
@@ -1253,7 +1560,7 @@ def _read_hermes_state_db(task_dir: Path) -> Optional[dict]:
             "input_tokens": inp,
             "output_tokens": out,
             "reasoning_tokens": reas,
-            "total_tokens": inp + out,
+            "total_tokens": inp + out + reas,
         }
     except Exception:
         return None

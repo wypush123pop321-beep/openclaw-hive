@@ -32,3 +32,6 @@ platform/settings/user_proxy_model.json
 # ===== data_viewer =====
 # 流水线下载/处理产物（含原始轨迹, 体积很大, 各环境自行拉取生成）
 data_viewer/pipeline_output/
+
+# OBS 多账号凭证(AK/SK), 各环境自行配置, 不提交
+data_viewer/obs_profiles.json

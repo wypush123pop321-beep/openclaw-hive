@@ -25,6 +25,7 @@ import argparse
 import json
 import os
 import re
+import sqlite3
 import sys
 
 
@@ -64,17 +65,52 @@ def find_assistant_trajectories(task_dir):
     return [latest]
 
 
-def analyze_trajectory(path):
-    """分析一条 assistant 轨迹。
+def _char_len(path):
+    """返回轨迹文件的原始字符数(读取为文本, 非法字节替换)。文件不存在/读取失败返回 0。"""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return len(f.read())
+    except OSError:
+        return 0
 
-    返回 dict: {tool_calls, plain_rounds, assistant_rounds}
+
+def has_task_done_marker(log_path):
+    """检查 task 主 log 是否包含「【Task_Done】」标记(assistant 回答末尾输出的任务完成信号)。
+    log 不存在时视为 False。"""
+    if not os.path.isfile(log_path):
+        return False
+    try:
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            return "【Task_Done】" in f.read()
+    except OSError:
+        return False
+
+
+def check_task_done_in_logs_dir(logs_dir, task_name):
+    """在 logs 目录下检查多个候选 log 文件是否含「【Task_Done】」标记。
+
+    有些 harness 将主 log 命名为 <task>.log，有些命名为 harness_automation.log。
+    依次尝试所有候选文件名，有任一匹配即返回 True。"""
+    candidates = [
+        task_name + ".log",
+        "harness_automation.log",
+    ]
+    return any(has_task_done_marker(os.path.join(logs_dir, name)) for name in candidates)
+
+
+def analyze_trajectory(path):
+    """分析一条 assistant 轨迹并提取 token 用量。
+
+    返回 dict: {tool_calls, plain_rounds, assistant_rounds, input_tokens, output_tokens, reasoning_tokens, total_tokens}
       tool_calls       : 全轨迹中 toolCall 的总次数
       plain_rounds     : 不带工具调用的 assistant 轮数（只有 thinking / text）
       assistant_rounds : assistant 消息轮数
+      *_tokens         : 各 assistant 消息 usage 字段累加（无 usage 时 = 0）
     """
     tool_calls = 0
     plain_rounds = 0
     assistant_rounds = 0
+    input_tk = output_tk = reasoning_tk = 0
 
     with open(path, encoding="utf-8", errors="replace") as f:
         for line in f:
@@ -92,6 +128,13 @@ def analyze_trajectory(path):
                 continue
 
             assistant_rounds += 1
+            # token 用量: 每条 assistant 消息可能有 usage
+            usage = msg.get("usage")
+            if isinstance(usage, dict):
+                input_tk += usage.get("input") or 0
+                output_tk += usage.get("output") or 0
+                reasoning_tk += usage.get("reasoningTokens") or 0
+
             content = msg.get("content")
             # content 可能是字符串（纯文本，无工具调用）或部件列表
             if isinstance(content, str):
@@ -111,6 +154,10 @@ def analyze_trajectory(path):
         "tool_calls": tool_calls,
         "plain_rounds": plain_rounds,
         "assistant_rounds": assistant_rounds,
+        "input_tokens": input_tk,
+        "output_tokens": output_tk,
+        "reasoning_tokens": reasoning_tk,
+        "total_tokens": input_tk + output_tk + reasoning_tk,
     }
 
 
@@ -412,6 +459,37 @@ def resolve_first_verdict(task_dir, task):
     return has_eval, score, source
 
 
+def read_hermes_state_db(task_dir):
+    """读取 Hermes 的 profiles/assistant1/state.db token 使用量。
+
+    返回 {input_tokens, output_tokens, reasoning_tokens, total_tokens}；
+    state.db 不存在或读取失败返回 None。"""
+    db_path = os.path.join(task_dir, "profiles", "assistant1", "state.db")
+    if not os.path.isfile(db_path):
+        return None
+    try:
+        con = sqlite3.connect(db_path)
+        con.row_factory = sqlite3.Row
+        row = con.execute(
+            "SELECT input_tokens, output_tokens, reasoning_tokens "
+            "FROM sessions LIMIT 1"
+        ).fetchone()
+        con.close()
+        if not row:
+            return None
+        inp = row["input_tokens"] or 0
+        out = row["output_tokens"] or 0
+        reas = row["reasoning_tokens"] or 0
+        return {
+            "input_tokens": inp,
+            "output_tokens": out,
+            "reasoning_tokens": reas,
+            "total_tokens": inp + out + reas,
+        }
+    except Exception:
+        return None
+
+
 def process_root(root):
     per_task = []
     for entry in sorted(os.scandir(root), key=lambda e: e.name):
@@ -419,6 +497,7 @@ def process_root(root):
             continue
         task = entry.name
         task_dir = entry.path
+        task_done = check_task_done_in_logs_dir(os.path.join(task_dir, "logs"), task)
 
         # 格式探测: 有 assistant sessions jsonl -> openclaw; 否则有 query1.json -> Hermes
         traj_paths = find_assistant_trajectories(task_dir)
@@ -427,7 +506,7 @@ def process_root(root):
             for tp in traj_paths:
                 info = analyze_trajectory(tp)
                 gate = info["tool_calls"] >= 3 and info["plain_rounds"] > 0
-                per_task.append({
+                entry = {
                     "task": task,
                     "trajectory": os.path.relpath(tp, root),
                     "tool_calls": info["tool_calls"],
@@ -440,11 +519,21 @@ def process_root(root):
                     "evaluator_completion": score,
                     "verdict_source": verdict_source,
                     "harness": "openclaw",
-                })
+                    "char_len": _char_len(tp),
+                    "task_done": task_done,
+                }
+                # 透传 token 数据（OC 从 .jsonl usage 字段提取）
+                if info.get("total_tokens"):
+                    entry["input_tokens"] = info["input_tokens"]
+                    entry["output_tokens"] = info["output_tokens"]
+                    entry["reasoning_tokens"] = info["reasoning_tokens"]
+                    entry["total_tokens"] = info["total_tokens"]
+                per_task.append(entry)
             continue
 
         # Hermes: 优先用 profiles/*/sessions/*.json (完整轨迹), 回退 query1.json (聚合视图)
         hermes_sessions = find_hermes_sessions(task_dir)
+        token_info = read_hermes_state_db(task_dir)  # Hermes task 共享同一份 state.db
         if hermes_sessions:
             # 有 profiles sessions: 每个 session 独立统计（一个 task 可能有多次重试）
             for session_path in hermes_sessions:
@@ -452,7 +541,7 @@ def process_root(root):
                 has_eval, score = extract_query1_verdict(find_query1_json(task_dir) or "")
                 # Hermes L1 门槛: 有产出即可(plain_rounds > 0)
                 gate = info["plain_rounds"] > 0
-                per_task.append({
+                entry = {
                     "task": task,
                     "trajectory": os.path.relpath(session_path, root),
                     "tool_calls": info["tool_calls"],
@@ -465,7 +554,15 @@ def process_root(root):
                     "evaluator_completion": score,
                     "verdict_source": "query1" if has_eval else None,
                     "harness": "hermes",
-                })
+                    "char_len": _char_len(session_path),
+                    "task_done": task_done,
+                }
+                if token_info:
+                    entry["input_tokens"] = token_info["input_tokens"]
+                    entry["output_tokens"] = token_info["output_tokens"]
+                    entry["reasoning_tokens"] = token_info["reasoning_tokens"]
+                    entry["total_tokens"] = token_info["total_tokens"]
+                per_task.append(entry)
             continue
 
         # Hermes 回退: 只有 query1.json，没有 profiles sessions
@@ -477,7 +574,7 @@ def process_root(root):
         # Hermes L1 门槛: 有产出即可(plain_rounds > 0), 不强制要求 ≥3 工具调用
         # (因 Hermes turn 粒度粗, 很多单轮对话任务 tool_calls=0 但有完整答复)
         gate = info["plain_rounds"] > 0
-        per_task.append({
+        entry = {
             "task": task,
             "trajectory": os.path.relpath(query1, root),
             "tool_calls": info["tool_calls"],
@@ -490,7 +587,15 @@ def process_root(root):
             "evaluator_completion": score,
             "verdict_source": "query1" if has_eval else None,
             "harness": "hermes",
-        })
+            "char_len": _char_len(query1),
+            "task_done": task_done,
+        }
+        if token_info:
+            entry["input_tokens"] = token_info["input_tokens"]
+            entry["output_tokens"] = token_info["output_tokens"]
+            entry["reasoning_tokens"] = token_info["reasoning_tokens"]
+            entry["total_tokens"] = token_info["total_tokens"]
+        per_task.append(entry)
     return per_task
 
 
@@ -502,6 +607,7 @@ def summarize(per_task):
     with_score = [t for t in ge3_plain if t["evaluator_completion"] is not None]
     score_ge_05 = [t for t in with_score if t["evaluator_completion"] >= 0.5]
     score_eq_1 = [t for t in with_score if t["evaluator_completion"] == 1.0]
+    task_done_count = len({t["task"] for t in per_task if t.get("task_done")})
 
     return {
         "total_tasks": total_tasks,
@@ -511,6 +617,7 @@ def summarize(per_task):
         "ge3_plain_and_has_evaluator_score": len(with_score),
         "score_ge_0.5": len(score_ge_05),
         "score_eq_1": len(score_eq_1),
+        "task_done_count": task_done_count,
     }
 
 

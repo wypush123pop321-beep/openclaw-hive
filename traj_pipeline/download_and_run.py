@@ -62,16 +62,28 @@ def dir_size(path):
     return total
 
 
-def download(obsutil, obs_path, dest_dir):
+def _redact_cmd(cmd):
+    """打印用: 把 -i/-k(access key / secret key)后面的值替换成 ***, 避免凭证出现在终端/日志里。"""
+    out = list(cmd)
+    for flag in ("-i", "-k"):
+        if flag in out:
+            idx = out.index(flag)
+            if idx + 1 < len(out):
+                out[idx + 1] = "***"
+    return out
+
+
+def download(obsutil, obs_path, dest_dir, obs_cred_args=None):
     """obsutil cp -r -f <obs_path> <dest_dir>, 实时打印 obsutil 进度/速度。
 
     默认(不加 -flat) obsutil 会在 dest_dir 下重建 obs 末段目录, 即
     dest_dir/<leaf>/...。这里把 dest_dir 设为 origin/, 让其自然落成 origin/<leaf>/。
+    obs_cred_args: 可选 ["-i", ak, "-k", sk, "-e", endpoint], 覆盖 obsutil 全局默认凭证。
     """
     os.makedirs(dest_dir, exist_ok=True)
     obs_path = obs_path if obs_path.endswith("/") else obs_path + "/"
-    cmd = [obsutil, "cp", "-r", "-f", obs_path, dest_dir]
-    print(f"  $ {' '.join(cmd)}", flush=True)
+    cmd = [obsutil, "cp", "-r", "-f", obs_path, dest_dir] + (obs_cred_args or [])
+    print(f"  $ {' '.join(_redact_cmd(cmd))}", flush=True)
     t0 = time.time()
 
     # obsutil 用 \r 刷新进度行; 按字符读, 遇 \r/\n 断行, 把含速度(B/s)的进度实时打印
@@ -201,7 +213,7 @@ def find_traj_dirs(origin):
     return assistant, evaluator
 
 
-def fetch(obsutil, source, dest_dir, ssh_password_env):
+def fetch(obsutil, source, dest_dir, ssh_password_env, obs_cred_args=None):
     """按 source 的 scheme 分发到 obsutil(obs://) 或 SFTP(ssh://)。
     SSH 密码从环境变量读, 从不出现在命令行参数或日志里。"""
     if is_ssh_url(source):
@@ -210,7 +222,7 @@ def fetch(obsutil, source, dest_dir, ssh_password_env):
             raise RuntimeError(f"缺少 SSH 密码(环境变量 {ssh_password_env} 未设置): {source}")
         download_ssh(source, dest_dir, password)
     else:
-        download(obsutil, source, dest_dir)
+        download(obsutil, source, dest_dir, obs_cred_args=obs_cred_args)
 
 
 def main():
@@ -221,19 +233,28 @@ def main():
     ap.add_argument("evaluator_obs", help="evaluator(质检) 轨迹来源: obs://... 或 ssh://user@host/remote/path/")
     ap.add_argument("out_dir",       help="输出目录(下载落到 <out_dir>/origin/, 结果落到 <out_dir>/)")
     ap.add_argument("--obsutil", default=DEFAULT_OBSUTIL, help=f"obsutil 路径(默认 {DEFAULT_OBSUTIL})")
+    ap.add_argument("--obs-ak", default=None, help="OBS Access Key ID(可选; 三个 --obs-* 参数要么都给要么都不给, "
+                    "用于覆盖 obsutil 全局默认凭证, 访问另一个账号/桶时用)")
+    ap.add_argument("--obs-sk", default=None, help="OBS Secret Access Key(可选, 见 --obs-ak)")
+    ap.add_argument("--obs-endpoint", default=None, help="OBS endpoint(可选, 如 obs.cn-east-4.myhuaweicloud.com, 见 --obs-ak)")
     a = ap.parse_args()
 
     need_obsutil = not (is_ssh_url(a.assistant_obs) and is_ssh_url(a.evaluator_obs))
     if need_obsutil and not os.path.exists(a.obsutil):
         ap.error(f"obsutil 不存在: {a.obsutil}")
 
+    obs_cred_vals = (a.obs_ak, a.obs_sk, a.obs_endpoint)
+    if any(obs_cred_vals) and not all(obs_cred_vals):
+        ap.error("--obs-ak / --obs-sk / --obs-endpoint 要么都给, 要么都不给")
+    obs_cred_args = ["-i", a.obs_ak, "-k", a.obs_sk, "-e", a.obs_endpoint] if all(obs_cred_vals) else []
+
     origin = os.path.join(a.out_dir, "origin")
     os.makedirs(origin, exist_ok=True)
 
     print(f"[1] 下载 assistant 轨迹 <- {a.assistant_obs}")
-    fetch(a.obsutil, a.assistant_obs, origin, "SSH_PASSWORD_ASSISTANT")
+    fetch(a.obsutil, a.assistant_obs, origin, "SSH_PASSWORD_ASSISTANT", obs_cred_args=obs_cred_args)
     print(f"[2] 下载 evaluator 轨迹 <- {a.evaluator_obs}")
-    fetch(a.obsutil, a.evaluator_obs, origin, "SSH_PASSWORD_EVALUATOR")
+    fetch(a.obsutil, a.evaluator_obs, origin, "SSH_PASSWORD_EVALUATOR", obs_cred_args=obs_cred_args)
 
     # 优先按 obs 末段名定位; 找不到再自动探测
     a_name, e_name = obs_leaf(a.assistant_obs), obs_leaf(a.evaluator_obs)

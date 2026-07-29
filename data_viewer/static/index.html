@@ -64,6 +64,8 @@ body{
 }
 .funnel-n{width:55px;text-align:right;font-weight:700;font-size:13px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;text-shadow:0 0 14px currentColor}
 .funnel-pct{width:44px;text-align:right;font-size:11px;color:var(--text-1);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.funnel-tokens{display:flex;gap:6px;margin-left:auto;font-size:11px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.token-total{background:rgba(255,194,60,0.15);color:var(--neon-amber);padding:1px 7px;border-radius:3px}
 .tbl-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:8px}
 .tbl-title{font-size:13px;font-weight:700;color:var(--text-0);display:flex;align-items:center;gap:6px;letter-spacing:.5px;text-transform:uppercase}
 .tbl-title::before{content:'';width:3px;height:14px;background:linear-gradient(var(--neon-cyan),var(--neon-purple));border-radius:2px;display:inline-block}
@@ -95,7 +97,8 @@ body{
   display:inline-block;animation:spin .8s linear infinite;
 }
 @keyframes spin{to{transform:rotate(360deg)}}
-.traj-viewer{margin-top:10px;max-height:420px;overflow:auto;border:1px solid var(--border);border-radius:6px;background:var(--bg-0)}
+.traj-viewer{margin-top:10px;max-height:65vh;overflow:auto;border:1px solid var(--border);border-radius:6px;background:var(--bg-0)}
+.traj-dialog{--el-dialog-width:90vw}.traj-dialog .el-dialog{max-width:1400px}.traj-dialog .el-dialog__body{max-height:80vh;overflow-y:auto}
 .traj-meta{font-size:11px;color:var(--text-2);padding:8px 12px;border-bottom:1px solid var(--border);position:sticky;top:0;background:var(--bg-0);display:flex;align-items:center;justify-content:space-between}
 .traj-toolbar{display:flex;gap:2px}
 .traj-msg{padding:10px 12px;border-bottom:1px solid rgba(0,217,255,.06);display:flex;gap:10px}
@@ -112,7 +115,7 @@ body{
 .role-user .traj-msg-role{color:var(--neon-cyan)}
 .role-assistant .traj-msg-role{color:var(--neon-purple)}
 .role-tool .traj-msg-role{color:var(--neon-green)}
-.traj-msg-body{flex:1;min-width:0;font-size:12px;line-height:1.6}
+.traj-msg-body{flex:1;min-width:0;font-size:13px;line-height:1.7}
 .traj-reasoning{color:var(--text-2);font-style:italic;white-space:pre-wrap;word-break:break-word;margin-bottom:6px}
 .traj-content{color:var(--text-0);white-space:pre-wrap;word-break:break-word}
 .traj-cut{color:var(--neon-amber);font-size:11px}
@@ -204,6 +207,10 @@ body{
         </div>
         <div class="funnel-pct" :style="{color:f.color}">{{ f.pct }}%</div>
         <div class="funnel-n" :style="{color:f.color}">{{ f.count }}</div>
+        <div v-if="f.tokens || f.charLen" class="funnel-tokens">
+          <span v-if="f.charLen" class="token-total" title="Estimated Tokens = Avg Char Len / 2.5">Estimated Tokens: {{ Math.round(f.charLen.avg_char_len / 2.5).toLocaleString() }}</span>
+          <span v-if="f.charLen" class="token-total" title="平均轨迹文件字符数(原始文本长度)">Avg Char Len: {{ f.charLen.avg_char_len.toLocaleString() }}</span>
+        </div>
       </div>
     </div>
 
@@ -254,6 +261,30 @@ body{
                 <div>{{ levelCount(col.idx, row) }}</div>
                 <div v-if="l0HasData(row)" style="font-size:10px;color:var(--text-1)">{{ pct(col.idx, row) }}</div>
               </div>
+            </template>
+            <span v-else style="color:var(--text-2)">—</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="Estimated Tokens(L1)" width="140" align="center">
+          <template #default="{row}">
+            <template v-if="row.available && row.char_len_stats && row.char_len_stats.L1">
+              <span style="font-family:ui-monospace,monospace;font-size:12px;color:var(--neon-amber)" title="Estimated Tokens = Avg Char Len / 2.5">{{ Math.round(row.char_len_stats.L1.avg_char_len / 2.5).toLocaleString() }}</span>
+            </template>
+            <span v-else style="color:var(--text-2)">—</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="Avg Char Len(L1)" width="140" align="center">
+          <template #default="{row}">
+            <template v-if="row.available && row.char_len_stats && row.char_len_stats.L1">
+              <span style="font-family:ui-monospace,monospace;font-size:12px;color:var(--neon-amber)">{{ row.char_len_stats.L1.avg_char_len.toLocaleString() }}</span>
+            </template>
+            <span v-else style="color:var(--text-2)">—</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="TASK_DONE数量" width="120" align="center">
+          <template #default="{row}">
+            <template v-if="row.available">
+              <span style="font-family:ui-monospace,monospace;font-size:12px;color:var(--neon-green)" title="log 日志含「【Task_Done】」标记的 task 数">{{ row.task_done_count || 0 }}</span>
             </template>
             <span v-else style="color:var(--text-2)">—</span>
           </template>
@@ -344,6 +375,12 @@ body{
             <span v-else style="color:var(--text-2);font-size:12px">—</span>
           </template>
         </el-table-column>
+        <el-table-column label="TASK_DONE" width="90" align="center">
+          <template #default="{row}">
+            <el-tag v-if="row.task_done !== undefined" :type="row.task_done ? 'success' : 'info'" size="small">{{ row.task_done ? '是' : '否' }}</el-tag>
+            <span v-else style="color:var(--text-2)">—</span>
+          </template>
+        </el-table-column>
         <el-table-column prop="eval_qc" label="Eval QC Trace" min-width="200" show-overflow-tooltip></el-table-column>
       </el-table>
       <div class="pg-wrap">
@@ -377,6 +414,15 @@ body{
           分别填 assistant 与 eval 两份 session_analysis 来源（现有方式）。
         </template>
       </div>
+    </el-form-item>
+
+    <el-form-item label="OBS 凭证 Profile">
+      <el-select v-model="taskForm.obs_profile" style="width:220px">
+        <el-option v-for="p in obsProfiles" :key="p" :label="p" :value="p"></el-option>
+      </el-select>
+      <span style="font-size:11px;color:var(--text-2);margin-left:10px">
+        default = 走 obsutil 全局默认凭证; 其它 profile 用于访问另一个账号/桶(需先在服务器上配置好)。
+      </span>
     </el-form-item>
 
     <!-- workspace: 单一根路径 -->
@@ -468,7 +514,7 @@ body{
 </el-dialog>
 
 <!-- Session Detail Dialog -->
-<el-dialog v-model="detailVisible" title="会话详情" width="720px" destroy-on-close>
+<el-dialog v-model="detailVisible" title="会话详情" width="90vw" destroy-on-close class="traj-dialog">
   <template v-if="selectedSession">
     <el-descriptions :column="1" border size="small">
       <el-descriptions-item label="Session ID">
@@ -607,10 +653,12 @@ createApp({
 
       taskFormVisible: false,
       taskFormSubmitting: false,
+      obsProfiles: ['default'],
       taskForm: {
         name: '',
         source_type: 'session_analysis',
         workspace_obs: '',
+        obs_profile: 'default',
         concurrency: 8,
         assistant_mode: 'obs', assistant_obs: '',
         assistant_ssh_user: '', assistant_ssh_host: '', assistant_ssh_password: '', assistant_ssh_path: '',
@@ -693,26 +741,37 @@ createApp({
     funnelRows() {
       const total = (this.stats.filtered_count || 0) + (this.stats.dropped_count || 0)
       const p = (n) => total ? Math.round((n || 0) / total * 100) : 0
+      const ts = this.stats.token_stats || {}
+      const cs = this.stats.char_len_stats || {}
       return [
         { label: 'L0', count: total, pct: 100, color: '#5b6a8f',
-          tip: `总轨迹数: 所有已登记任务下载到本地的原始轨迹总数(筛选后 ${this.stats.filtered_count || 0} + 丢弃 ${this.stats.dropped_count || 0})` },
+          tip: `总轨迹数: 所有已登记任务下载到本地的原始轨迹总数(筛选后 ${this.stats.filtered_count || 0} + 丢弃 ${this.stats.dropped_count || 0})`,
+          tokens: ts.L0 || null, charLen: cs.L0 || null },
         { label: 'L1', count: this.stats.filtered_count || 0, pct: p(this.stats.filtered_count), color: '#00d9ff',
-          tip: '可用/合格轨迹数: 通过基础质量筛查(session_analysis 来源=错误备注为空或仅含"200空响应"; workspace 来源=≥3次工具调用且有纯轮)' },
+          tip: '可用/合格轨迹数: 通过基础质量筛查(session_analysis 来源=错误备注为空或仅含"200空响应"; workspace 来源=≥3次工具调用且有纯轮)',
+          tokens: ts.L1 || null, charLen: cs.L1 || null },
+        { label: 'T_DONE', count: this.stats.task_done_count || 0, pct: p(this.stats.task_done_count), color: '#ff7b89',
+          tip: `log 日志含「【Task_Done】」标记的 assistant 回答数(共 ${this.stats.task_done_count || 0} 条, 表示任务全流程正常完成)`,
+          tokens: ts.T_DONE || null, charLen: cs.T_DONE || null },
         { label: 'L1.5', count: this.stats.with_eval_count || 0, pct: p(this.stats.with_eval_count), color: '#00ffa8',
-          tip: '有 evaluator 首轮评测结果的轨迹数(session_analysis 来源=含 completion=null 的裁决; workspace 来源=仅计 turn=1 数值分)' },
+          tip: '有 evaluator 首轮评测结果的轨迹数(session_analysis 来源=含 completion=null 的裁决; workspace 来源=仅计 turn=1 数值分)',
+          tokens: ts['L1.5'] || null, charLen: cs['L1.5'] || null },
         { label: 'L2', count: this.stats['completion_ge_0.5'] || 0, pct: p(this.stats['completion_ge_0.5']), color: '#ffc23c',
-          tip: 'evaluator 给出的 completion 分数 ≥ 0.5 的轨迹数(仅统计 completion 为数值的情况)' },
+          tip: 'evaluator 给出的 completion 分数 ≥ 0.5 的轨迹数(仅统计 completion 为数值的情况)',
+          tokens: ts.L2 || null, charLen: cs.L2 || null },
         { label: 'L3', count: this.stats.completion_eq_1 || 0, pct: p(this.stats.completion_eq_1), color: '#ff3d6e',
-          tip: 'evaluator 给出的 completion 分数 = 1 的轨迹数，即完全达成任务的最高质量轨迹' },
+          tip: 'evaluator 给出的 completion 分数 = 1 的轨迹数，即完全达成任务的最高质量轨迹',
+          tokens: ts.L3 || null, charLen: cs.L3 || null },
       ]
     },
     levelColumns() {
       return [
         { label: 'L0', idx: 0 },
         { label: 'L1', idx: 1 },
-        { label: 'L1.5', idx: 2 },
-        { label: 'L2', idx: 3 },
-        { label: 'L3', idx: 4 },
+        { label: 'T_DONE', idx: 2 },
+        { label: 'L1.5', idx: 3 },
+        { label: 'L2', idx: 4 },
+        { label: 'L3', idx: 5 },
       ]
     },
   },
@@ -722,6 +781,7 @@ createApp({
       const counts = [
         (row.filtered_count || 0) + (row.dropped_count || 0),
         row.filtered_count || 0,
+        row.task_done_count || 0,
         row.with_eval_count || 0,
         row['completion_ge_0.5'] || 0,
         row.completion_eq_1 || 0,
@@ -779,11 +839,12 @@ createApp({
       finally { this.loading = false }
     },
 
-    openTaskForm() {
+    async openTaskForm() {
       this.taskForm = {
         name: '',
         source_type: 'session_analysis',
         workspace_obs: '',
+        obs_profile: 'default',
         concurrency: 8,
         assistant_mode: 'obs', assistant_obs: '',
         assistant_ssh_user: '', assistant_ssh_host: '', assistant_ssh_password: '', assistant_ssh_path: '',
@@ -791,6 +852,12 @@ createApp({
         evaluator_ssh_user: '', evaluator_ssh_host: '', evaluator_ssh_password: '', evaluator_ssh_path: '',
       }
       this.taskFormVisible = true
+      try {
+        const r = await axios.get('/api/obs-profiles')
+        this.obsProfiles = r.data.profiles || ['default']
+      } catch (e) {
+        this.obsProfiles = ['default']
+      }
     },
     // 服务器路径模式下拼成 ssh://user@host/remote/path/ 存进 *_obs 字段(不含密码),
     // 密码单独通过 *_ssh_password 字段随这一次请求发送, 后端不会把它写进 tasks.json。
@@ -818,7 +885,11 @@ createApp({
           ElementPlus.ElMessage.warning('任务名称、Workspace OBS 根路径不能为空')
           return
         }
-        payload = { name, source_type: 'workspace', workspace_obs, concurrency: this.taskForm.concurrency || 8 }
+        payload = {
+          name, source_type: 'workspace', workspace_obs,
+          obs_profile: this.taskForm.obs_profile || 'default',
+          concurrency: this.taskForm.concurrency || 8,
+        }
       } else {
         const assistant = this.buildSourcePayload('assistant')
         const evaluatorSrc = this.buildSourcePayload('evaluator')
@@ -829,6 +900,7 @@ createApp({
         payload = {
           name,
           source_type: 'session_analysis',
+          obs_profile: this.taskForm.obs_profile || 'default',
           assistant_obs: assistant.obs,
           assistant_ssh_password: assistant.password,
           evaluator_obs: evaluatorSrc.obs,
