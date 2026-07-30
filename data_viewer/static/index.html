@@ -653,6 +653,28 @@ body{
             <span>{{ logData.filename }} · {{ (logData.size/1024).toFixed(1) }} KB</span>
             <span v-if="logData.truncated" style="color:var(--neon-orange,#e6a23c)">日志过大，仅显示尾部 2 MB</span>
           </div>
+          <!-- rubric 裁决(从日志解析, 放在 log 上文) -->
+          <template v-if="logData.verdict">
+            <div class="rubric-panel" style="margin:0;border-radius:0;border-left:none;border-right:none;border-top:none">
+              <div class="rubric-summary">
+                <span class="rubric-completion" :style="{color: completionColor(logData.verdict.completion)}">
+                  Completion: {{ logData.verdict.completion ?? '—' }}
+                </span>
+                <span v-if="logData.verdict.inclination" class="rubric-inclination">裁决倾向: {{ logData.verdict.inclination }}</span>
+              </div>
+              <div v-if="logData.verdict.reason" class="rubric-reason">{{ logData.verdict.reason }}</div>
+              <div v-if="logData.verdict.rubric_checks && logData.verdict.rubric_checks.length" class="rubric-list">
+                <div v-for="(rc, i) in logData.verdict.rubric_checks" :key="i" class="rubric-item" :class="{'rubric-fail': !rc.passed}">
+                  <div class="rubric-item-hdr">
+                    <el-tag :type="rc.kind === 'gate' ? 'warning' : 'info'" size="small" effect="dark">{{ rc.kind === 'gate' ? 'Gate' : 'Reward' }}</el-tag>
+                    <el-tag :type="rc.passed ? 'success' : 'danger'" size="small">{{ rc.passed ? '满足 (1)' : '不满足 (0)' }}</el-tag>
+                  </div>
+                  <div class="rubric-criterion">{{ rc.criterion }}</div>
+                  <div v-if="rc.evidence" class="rubric-evidence">理由: {{ rc.evidence }}</div>
+                </div>
+              </div>
+            </div>
+          </template>
           <pre class="log-pre">{{ logData.log }}</pre>
         </template>
         <el-alert v-else-if="!logLoading && !logError" title="该会话无独立 log 文件" type="info" show-icon :closable="false" style="margin-top:10px"></el-alert>

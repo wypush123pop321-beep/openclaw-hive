@@ -1093,17 +1093,22 @@ def api_task_sessions(
 
     # 为每个会话计算层级并筛选
     levels = set()
-    show_task_done = False
+    want_task_done = None   # None=不限制, True=只要 task_done, False=排除 task_done
     if level_filter:
         parts = [l.strip() for l in level_filter.split(",")]
-        show_task_done = "TASK_DONE" in parts
+        if "TASK_DONE" in parts:
+            want_task_done = True
         levels = {l for l in parts if l in ("L0", "L1", "L1.5", "L2", "L3")}
+        if levels and want_task_done is None:
+            want_task_done = False   # 选了层级但没勾 TASK_DONE → 排除有 TASK_DONE 的
     for s in sessions:
         s["level"] = _get_session_level(s)
     if levels:
         sessions = [s for s in sessions if s["level"] in levels]
-    if show_task_done:
+    if want_task_done is True:
         sessions = [s for s in sessions if s.get("task_done")]
+    elif want_task_done is False:
+        sessions = [s for s in sessions if not s.get("task_done")]
 
     total = len(sessions)
     start = (page - 1) * page_size
@@ -1561,7 +1566,8 @@ def _load_session_log_content(task: dict, session: str) -> Optional[dict]:
             nl = text.find("\n")
             if nl >= 0:
                 text = text[nl + 1:]
-        return {"filename": log_path.name, "size": size, "truncated": truncated, "log": text}
+        verdict = _extract_verdict_from_log(session, task["output_dir"])
+        return {"filename": log_path.name, "size": size, "truncated": truncated, "log": text, "verdict": verdict}
     except OSError:
         return None
 
@@ -2002,12 +2008,14 @@ def api_task_session_log(task_id: str, session: str):
                 text = text[nl + 1:]
     except OSError:
         return JSONResponse({"found": False, "message": "读取 log 文件失败"}, status_code=500)
+    verdict = _extract_verdict_from_log(session, task["output_dir"])
     return {
         "found": True,
         "filename": log_path.name,
         "size": size,
         "truncated": truncated,
         "log": text,
+        "verdict": verdict,
     }
 
 
