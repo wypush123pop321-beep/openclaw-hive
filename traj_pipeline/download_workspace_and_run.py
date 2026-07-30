@@ -184,6 +184,170 @@ def download_task(obsutil, task_obs, dest_dir,
                            f"{(res.stdout or '')[-400:]}")
 
 
+def harness_tsr_to_entries(d):
+    """把单个 task 的采集侧 logs/traj_stats_result.json 映射成 traj_stats 内部 per_task entry。
+
+    采集 harness 在每个 task 目录下产出 <task>/logs/traj_stats_result.json, 结构是单 task 对象:
+      {task, config_file, log_file, harness_home, task_level, best_completion,
+       agents:[{agent, trajectory, tool_calls, assistant_rounds, plain_rounds,
+                has_ge3_toolcalls, has_plain_round, has_eval, evaluator_completion,
+                verdict_source, level}]}
+    注意该文件**不含 char_len / token** 字段(那两个要读轨迹正文才算), 故这里也不产出这些键,
+    使 stats_from_per_task 里 char_len_stats/token_stats 归 None(快速路径两列先留空, 详情按需回填)。
+
+    对 agents 里每个 agent 产出一条 entry; 无法解析(缺 agents)时返回 []。
+    """
+    task = d.get("task")
+    agents = d.get("agents")
+    if not task or not isinstance(agents, list):
+        return []
+    harness_home = d.get("harness_home") or ""
+    harness = "openclaw" if ".openclaw" in harness_home else "hermes"
+    entries = []
+    for a in agents:
+        if not isinstance(a, dict):
+            continue
+        tc = a.get("tool_calls") or 0
+        pr = a.get("plain_rounds") or 0
+        has_ge3 = bool(a.get("has_ge3_toolcalls"))
+        has_plain = bool(a.get("has_plain_round"))
+        # L1 门槛: openclaw = ≥3工具调用 且 有纯轮; hermes = 有产出(纯轮>0)。与 process_root 口径一致。
+        passed = (has_ge3 and has_plain) if harness == "openclaw" else has_plain
+        # trajectory 绝对容器路径(如 <harness_home>/agents/main/sessions/<uuid>.jsonl)
+        # → 映射成 origin 相对路径 <task>/agents/main/sessions/<uuid>.jsonl, 供详情页按需下载定位。
+        traj_abs = a.get("trajectory") or ""
+        try:
+            rel = os.path.relpath(traj_abs, harness_home) if (traj_abs and harness_home) else traj_abs
+        except ValueError:
+            rel = traj_abs
+        traj_rel = os.path.join(task, rel) if rel else None
+        entries.append({
+            "task": task,
+            "trajectory": traj_rel,
+            "tool_calls": tc,
+            "assistant_rounds": a.get("assistant_rounds") or 0,
+            "plain_rounds": pr,
+            "has_ge3_toolcalls": has_ge3,
+            "has_plain_round": has_plain,
+            "passed_gate": passed,
+            "has_eval": bool(a.get("has_eval")),
+            "evaluator_completion": a.get("evaluator_completion"),
+            "verdict_source": a.get("verdict_source"),
+            "harness": harness,
+            # 不写 char_len / total_tokens: 快速路径两列留空, 详情按需回填
+        })
+    return entries
+
+
+def _fetch_task_done_marker(obsutil, task_obs, origin, leaf, log_file,
+                            obs_cred_args=None):
+    """快速路径补齐 TASK_DONE: traj_stats_result.json 不含 task_done 字段,
+    该标记只在主 .log 正文里, 故这里额外下载主 log 并扫「【Task_Done】」标记。
+
+    log_file 来自 traj_stats_result.json 的 log_file 字段(相对 task 目录, 如 logs/xxx.log);
+    缺失时回退按 check_task_done_in_logs_dir 的候选名(<leaf>.log / harness_automation.log)逐个尝试。
+    命中任一即 True; 全部下载失败/无标记返回 False。
+    """
+    candidates = []
+    if log_file:
+        candidates.append(log_file.replace("\\", "/").lstrip("/"))
+    for name in (leaf + ".log", "harness_automation.log"):
+        rel = "logs/" + name
+        if rel not in candidates:
+            candidates.append(rel)
+    for rel in candidates:
+        dest = os.path.join(origin, leaf, *rel.split("/"))
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        obj_url = task_obs + rel
+        cmd = [obsutil, "cp", obj_url, dest, "-f"] + (obs_cred_args or [])
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True,
+                                 encoding="utf-8", errors="replace", timeout=300)
+        except Exception:
+            continue
+        if res.returncode != 0 or not os.path.isfile(dest):
+            continue                  # 该候选名不存在, 试下一个
+        # 成功下到主 log 即为定论: 一个 task 只有一份主 log, 有没有标记看这份即可,
+        # 不再试其它候选名(避免绝大多数「未完成」任务白白多下 1~2 个 log 文件)。
+        return traj_stats.has_task_done_marker(dest)
+    return False
+
+
+def _fetch_one_task_stats(obsutil, task_obs, origin, obs_cred_args=None,
+                          with_task_done=True):
+    """下载单个 task 的 logs/traj_stats_result.json 到 origin/<leaf>/logs/traj_stats_result.json,
+    解析并经 harness_tsr_to_entries 展平。文件不存在/失败返回 []。
+
+    with_task_done=True 时额外下载主 log 扫「【Task_Done】」标记, 回填每条 entry 的 task_done
+    (traj_stats_result.json 本身不含该字段)。"""
+    task_obs = task_obs if task_obs.endswith("/") else task_obs + "/"
+    leaf = task_obs.rstrip("/").split("/")[-1]
+    dest = os.path.join(origin, leaf, "logs", "traj_stats_result.json")
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    obj_url = task_obs + "logs/traj_stats_result.json"
+    cmd = [obsutil, "cp", obj_url, dest, "-f"] + (obs_cred_args or [])
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True,
+                             encoding="utf-8", errors="replace", timeout=120)
+    except Exception:
+        return []
+    if res.returncode != 0 or not os.path.isfile(dest):
+        return []                     # 该 task 无此文件(老 workspace), 正常, 不刷错误
+    try:
+        with open(dest, encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    entries = harness_tsr_to_entries(data)
+    if entries and with_task_done:
+        done = _fetch_task_done_marker(obsutil, task_obs, origin, leaf,
+                                       data.get("log_file"), obs_cred_args)
+        for e in entries:
+            e["task_done"] = done
+    return entries
+
+
+def fetch_per_task_stats_files(obsutil, workspace_obs, origin, obs_cred_args=None,
+                               concurrency=8, with_task_done=True):
+    """快速路径: 枚举 workspace 下各 task, 并发下载每个 <task>/logs/traj_stats_result.json
+    (每份约 1KB), 展平成 per_task 列表返回。
+
+    with_task_done=True 时每个 task 额外下载主 log 扫「【Task_Done】」标记(带宽略增, 但仍远小于
+    整包轨迹); False 则跳过, TASK_DONE 计数恒为 0(与旧 fast 行为一致)。
+
+    一个都没拿到(老 workspace 或无此文件)返回 None, 调用方回退逐 task 全量下载老逻辑。
+    """
+    tasks = list_task_dirs(obsutil, workspace_obs, obs_cred_args=obs_cred_args)
+    if not tasks:
+        return None
+    total = len(tasks)
+    step = "下 stats + 扫主 log(TASK_DONE)" if with_task_done else "下 stats"
+    print(f"      [fast] 共 {total} 个 task, 并发 {concurrency} {step}, 逐个上报进度 ...",
+          flush=True)
+    per_task = []
+    got = 0
+    done_n = 0
+    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as ex:
+        futs = {ex.submit(_fetch_one_task_stats, obsutil, t, origin, obs_cred_args,
+                          with_task_done): t
+                for t in tasks}
+        for fut in as_completed(futs):
+            done_n += 1
+            entries = fut.result()
+            if entries:
+                got += 1
+                per_task.extend(entries)
+            # 逐 task 上报: 每完成一个都打一行, 让前端/终端能看到进度, 不再长时间静默
+            if done_n % 5 == 0 or done_n == total:
+                print(f"      [fast] 进度 {done_n}/{total} (命中 {got})", flush=True)
+    if got == 0:
+        return None
+    print(f"      [fast] {got}/{total} 个 task 命中 logs/traj_stats_result.json", flush=True)
+    return per_task
+
+
 def _avg_tokens(entries, tier_key, tier_entries):
     """计算某一档次的平均 token 总长度，同时返回原始 sum + count 以便跨任务聚合。
 
@@ -242,7 +406,17 @@ def build_platform_stats(origin):
     L1 以下全部收敛到「通过门槛」的子集内统计; 未过门槛的轨迹计入 dropped_count。
     """
     per_task = traj_stats.process_root(origin)
+    return stats_from_per_task(per_task, source_type="workspace")
 
+
+def stats_from_per_task(per_task, source_type="workspace"):
+    """把 traj_stats 的 per_task(process_root 的返回, 或 traj_stats_result.json 的 details)
+    按 workspace 门槛口径聚合成 filter_stats.json 结构。
+
+    抽出此函数是为了让「快速路径」(直接吃 workspace 根目录已有的 traj_stats_result.json.details)
+    与「老路径」(本地 process_root)共用同一套 tier 聚合逻辑, 保证两条路口径一致。
+    source_type 仅用于 note/source_type 标注, 不影响聚合。
+    """
     per_session = []
     kept = with_eval = ge05 = eq1 = 0
     dropped = 0
@@ -317,7 +491,7 @@ def build_platform_stats(origin):
                  "L1=ge3_and_plain_round(≥3工具调用+有纯轮), "
                  "L1.5=L1内有 turn=1 数值 completion(不含 null), "
                  "L2/L3=L1.5内 turn=1 completion>=0.5 / ==1"),
-        "source_type": "workspace",
+        "source_type": source_type,
         "per_session": per_session,
         "token_stats": token_stats if token_stats else None,
         "char_len_stats": char_len_stats if char_len_stats else None,
@@ -339,6 +513,10 @@ def main():
                     "用于覆盖 obsutil 全局默认凭证, 访问另一个账号/桶时用)")
     ap.add_argument("--obs-sk", default=None, help="OBS Secret Access Key(可选, 见 --obs-ak)")
     ap.add_argument("--obs-endpoint", default=None, help="OBS endpoint(可选, 如 obs.cn-east-4.myhuaweicloud.com, 见 --obs-ak)")
+    ap.add_argument("--no-fast", action="store_true",
+                    help="禁用快速路径(即使 workspace 根目录有 traj_stats_result.json 也强制逐 task 下载重算)")
+    ap.add_argument("--fast-no-task-done", action="store_true",
+                    help="快速路径下不额外下载主 log 扫「【Task_Done】」标记(更快, 但 TASK_DONE 计数恒为 0)")
     a = ap.parse_args()
 
     if not os.path.exists(a.obsutil):
@@ -351,6 +529,35 @@ def main():
 
     origin = os.path.join(a.out_dir, "origin")
     os.makedirs(origin, exist_ok=True)
+
+    # ── 快速路径: 各 task 目录下已有采集侧预生成的 logs/traj_stats_result.json ──
+    #   只下这些每份 ~1KB 的小文件, 展平成 per_task 出 filter_stats.json, 不再逐 task 下载
+    #   原始轨迹(具体 assistant 轨迹改由详情页按需懒加载)。char_len/token 两列先留空, 详情按需回填。
+    #   一个都没有(老 workspace)则回退下面的逐 task 全量下载老逻辑。
+    if not a.no_fast:
+        _td = " (含主 log TASK_DONE 扫描)" if not a.fast_no_task_done else ""
+        print(f"[fast] 探测各 task 的 logs/traj_stats_result.json{_td} ...", flush=True)
+        details = fetch_per_task_stats_files(a.obsutil, a.workspace_obs, origin,
+                                             obs_cred_args=obs_cred_args,
+                                             concurrency=a.concurrency,
+                                             with_task_done=not a.fast_no_task_done)
+        if details is not None:
+            print(f"      命中! 复用采集侧统计({len(details)} 条轨迹), 跳过逐 task 全量下载", flush=True)
+            stats = stats_from_per_task(details, source_type="workspace")
+            stats["fast_path"] = True     # 标记: 本次走快速路径(原始轨迹未整包下载, 详情按需拉)
+            out_path = os.path.join(a.out_dir, "filter_stats.json")
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(stats, f, ensure_ascii=False, indent=2)
+            total_traj = stats["filtered_count"] + stats["dropped_count"]
+            print(f"[done] (快速路径) 结果 -> {out_path}", flush=True)
+            print(f"      总轨迹数(L0)               : {total_traj}", flush=True)
+            print(f"      合格轨迹 ≥3工具+纯轮(L1)   : {stats['filtered_count']}", flush=True)
+            print(f"      L1内有 evaluator 裁决(L1.5): {stats['with_eval_count']}", flush=True)
+            print(f"      completion >= 0.5 (L2)    : {stats['completion_ge_0.5']}", flush=True)
+            print(f"      completion == 1  (L3)     : {stats['completion_eq_1']}", flush=True)
+            print(f"      含「【Task_Done】」标记        : {stats['task_done_count']}", flush=True)
+            return
+        print(f"      未命中(老 workspace 或无此文件), 回退逐 task 下载", flush=True)
 
     print(f"[1] 枚举 task 子目录 <- {a.workspace_obs}", flush=True)
     tasks = list_task_dirs(a.obsutil, a.workspace_obs, obs_cred_args=obs_cred_args)

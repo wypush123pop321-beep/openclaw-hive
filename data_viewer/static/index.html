@@ -168,6 +168,7 @@ body{
     </el-tag>
     <span v-if="jobStatus.running" style="font-size:11px;color:var(--neon-amber);font-family:ui-monospace,monospace">已运行 {{ elapsedSeconds }}s</span>
     <el-button v-if="jobStatus.running" size="small" type="danger" @click="stopJob">终止采集</el-button>
+    <el-tag v-if="jobStatus.queue_len > 0" type="info" size="small" title="按登记顺序排队等待采集">队列 {{ jobStatus.queue_len }} 个等待</el-tag>
     <el-button size="small" type="primary" @click="openTaskForm">登记采集任务</el-button>
   </div>
 </div>
@@ -189,6 +190,18 @@ body{
         <pre class="log-tail">{{ jobStatus.log_tail.join('\n') }}</pre>
       </el-collapse-item>
     </el-collapse>
+  </el-alert>
+
+  <!-- 采集排队列表 -->
+  <el-alert v-if="jobStatus.queue && jobStatus.queue.length" type="info" show-icon :closable="false" style="margin-bottom:18px">
+    <template #title>采集队列（{{ jobStatus.queue.length }} 个等待，按登记顺序执行）</template>
+    <div style="display:flex;flex-direction:column;gap:6px;margin-top:6px">
+      <div v-for="(it, i) in jobStatus.queue" :key="it.task_id" style="display:flex;align-items:center;gap:8px">
+        <el-tag size="small" type="info">第 {{ i + 1 }} 位</el-tag>
+        <span style="font-size:12px">{{ it.name || it.task_id }}</span>
+        <el-button size="small" text type="danger" @click="cancelQueue({id: it.task_id, name: it.name})">取消排队</el-button>
+      </div>
+    </div>
   </el-alert>
 
   <!-- ============ 总览视图 ============ -->
@@ -219,14 +232,14 @@ body{
         <div class="tbl-title">采集任务 <el-tag size="small" type="info">共 {{ filteredTasks.length }} 个</el-tag></div>
         <div style="display:flex;gap:8px;align-items:center">
           <span style="font-size:12px;color:var(--text-1)">按分组筛选:</span>
-          <el-select v-model="selectedGroup" placeholder="全部任务" clearable size="small" style="width:180px" @change="filterTasksByGroup">
+          <el-select v-model="selectedGroup" placeholder="全部任务" clearable size="small" style="width:180px" @change="onGroupChange">
             <el-option label="全部任务" value=""></el-option>
             <el-option label="未分组" value="__ungroup__"></el-option>
             <el-option v-for="g in allGroups" :key="g" :label="g" :value="g"></el-option>
           </el-select>
         </div>
       </div>
-      <el-table :data="filteredTasks" size="small" border v-loading="tasksLoading">
+      <el-table :data="pagedTasks" size="small" border v-loading="tasksLoading">
         <el-table-column label="任务名称" min-width="180" show-overflow-tooltip>
           <template #default="{row}">
             <span class="task-name-link" @click="enterTask(row)">{{ row.name }}</span>
@@ -292,6 +305,7 @@ body{
         <el-table-column label="状态" width="100" align="center">
           <template #default="{row}">
             <el-tag v-if="jobStatus.running && jobStatus.task_id === row.id" type="warning" size="small">采集中</el-tag>
+            <el-tag v-else-if="queuePosition(row.id) > 0" type="info" size="small">排队中(第{{ queuePosition(row.id) }}位)</el-tag>
             <el-tag v-else-if="row.last_exit_code === 0" type="success" size="small">成功</el-tag>
             <el-tag v-else-if="row.last_exit_code !== null && row.last_exit_code !== undefined" type="danger" size="small">失败</el-tag>
             <el-tag v-else type="info" size="small">未运行</el-tag>
@@ -299,7 +313,8 @@ body{
         </el-table-column>
         <el-table-column label="操作" width="340" align="center">
           <template #default="{row}">
-            <el-button size="small" text :disabled="jobStatus.running" @click="retriggerTask(row)">重新采集</el-button>
+            <el-button v-if="queuePosition(row.id) > 0" size="small" text type="danger" @click="cancelQueue(row)">取消排队</el-button>
+            <el-button v-else size="small" text :disabled="jobStatus.running && jobStatus.task_id === row.id" @click="retriggerTask(row)">重新采集</el-button>
             <el-button size="small" text :disabled="!row.available" @click="downloadOrigin(row)">下载原始轨迹</el-button>
             <el-button size="small" text @click="openRenameForm(row)">重命名</el-button>
             <el-button size="small" text @click="openGroupsForm(row)">编辑分组</el-button>
@@ -311,6 +326,10 @@ body{
           </template>
         </el-table-column>
       </el-table>
+      <div style="display:flex;justify-content:flex-end;margin-top:12px">
+        <el-pagination v-model:current-page="taskPage" :page-size="taskPageSize"
+          :total="filteredTasks.length" layout="total, prev, pager, next" background small></el-pagination>
+      </div>
     </div>
   </template>
 
@@ -352,7 +371,8 @@ body{
             <el-option :value="20" label="20 / 页"></el-option>
             <el-option :value="50" label="50 / 页"></el-option>
           </el-select>
-          <el-button size="small" :disabled="jobStatus.running" @click="retriggerTask(activeTask)">重新采集</el-button>
+          <el-button v-if="queuePosition(activeTaskId) > 0" size="small" type="danger" @click="cancelQueue(activeTask)">取消排队</el-button>
+          <el-button v-else size="small" :disabled="jobStatus.running && jobStatus.task_id === activeTaskId" @click="retriggerTask(activeTask)">重新采集</el-button>
         </div>
       </div>
       <el-table :data="sessions" v-loading="loading" stripe border size="small"
@@ -650,6 +670,8 @@ createApp({
       activeTaskId: null,
       selectedGroup: localStorage.getItem('selectedGroup') || '学习生活',
       filteredTasks: [],
+      taskPage: 1,
+      taskPageSize: 10,
 
       taskFormVisible: false,
       taskFormSubmitting: false,
@@ -687,7 +709,7 @@ createApp({
       pageSize: 20,
       completionFilter: '',
       loading: false,
-      jobStatus: {},
+      jobStatus: {running: false, queue: [], queue_len: 0},
       selectedSession: null,
       detailVisible: false,
       trajLoading: false,
@@ -706,6 +728,11 @@ createApp({
   },
 
   computed: {
+    pagedTasks() {
+      // 客户端分页: 任务已全量加载, 按当前页切片渲染, 避免一次性渲染全部导致卡顿
+      const start = (this.taskPage - 1) * this.taskPageSize
+      return this.filteredTasks.slice(start, start + this.taskPageSize)
+    },
     activeTask() {
       return this.tasks.find(t => t.id === this.activeTaskId) || null
     },
@@ -811,15 +838,16 @@ createApp({
         }
       } catch (e) { console.error('loadStats', e) }
     },
-    async loadTasks() {
-      this.tasksLoading = true
+    async loadTasks(silent = false) {
+      // silent: 后台轮询刷新时不切换 loading 遮罩, 避免表格每次轮询闪烁
+      if (!silent) this.tasksLoading = true
       try {
         const r = await axios.get('/api/tasks')
         this.tasks = r.data.tasks
         await this.loadAllGroups()
         this.filterTasksByGroup()
       } catch (e) { console.error('loadTasks', e) }
-      finally { this.tasksLoading = false }
+      finally { if (!silent) this.tasksLoading = false }
     },
     async loadJobStatus() {
       try { const r = await axios.get('/api/job-status'); this.jobStatus = r.data }
@@ -914,11 +942,13 @@ createApp({
           ElementPlus.ElMessage.success(r.data.message)
           this.taskFormVisible = false
           await this.loadTasks()
+          // 无论立即开始还是排队, 都启动轮询以实时反映队列进度
           if (r.data.started) {
             this.jobStatus = { ...this.jobStatus, running: true, task_id: r.data.task.id, started_at: new Date().toISOString() }
             this.startTicking()
-            this.startPollUntilDone()
           }
+          await this.loadJobStatus()
+          this.startPollUntilDone()
         } else {
           ElementPlus.ElMessage.error(r.data.message || '登记失败')
         }
@@ -926,6 +956,26 @@ createApp({
         ElementPlus.ElMessage.error(e.response?.data?.message || '登记失败，请检查后端服务')
       } finally {
         this.taskFormSubmitting = false
+      }
+    },
+
+    queuePosition(taskId) {
+      // 该任务在采集队列中的位次(1-based); 不在队列返回 0
+      const q = this.jobStatus.queue || []
+      const i = q.findIndex(it => it.task_id === taskId)
+      return i < 0 ? 0 : i + 1
+    },
+    async cancelQueue(task) {
+      try {
+        const r = await axios.post(`/api/tasks/${task.id}/dequeue`)
+        if (r.data.success) {
+          ElementPlus.ElMessage.success('已移出采集队列')
+          await this.loadJobStatus(); await this.loadTasks()
+        } else {
+          ElementPlus.ElMessage.warning(r.data.message || '取消排队失败')
+        }
+      } catch (e) {
+        ElementPlus.ElMessage.error(e.response?.data?.message || '取消排队失败，请检查后端服务')
       }
     },
 
@@ -960,8 +1010,11 @@ createApp({
         })
         if (r.data.success) {
           ElementPlus.ElMessage.success(r.data.message)
-          this.jobStatus = { ...this.jobStatus, running: true, task_id: task.id, started_at: new Date().toISOString() }
-          this.startTicking()
+          if (r.data.started) {
+            this.jobStatus = { ...this.jobStatus, running: true, task_id: task.id, started_at: new Date().toISOString() }
+            this.startTicking()
+          }
+          await this.loadJobStatus()
           this.startPollUntilDone()
         } else {
           ElementPlus.ElMessage.warning(r.data.message)
@@ -1091,6 +1144,11 @@ createApp({
       document.body.removeChild(a)
       ElementPlus.ElMessage.success('已开始下载原始轨迹（数据较大，请耐心等待浏览器完成下载）')
     },
+    onGroupChange() {
+      // 用户主动切换分组时回到第一页(与轮询中的静默筛选区分开)
+      this.taskPage = 1
+      this.filterTasksByGroup()
+    },
     filterTasksByGroup() {
       if (!this.selectedGroup) {
         this.filteredTasks = this.tasks
@@ -1099,6 +1157,9 @@ createApp({
       } else {
         this.filteredTasks = this.tasks.filter(t => (t.groups || []).includes(this.selectedGroup))
       }
+      // 筛选结果变化后, 若当前页超出范围则回到最后一页(避免停在空页)
+      const maxPage = Math.max(1, Math.ceil(this.filteredTasks.length / this.taskPageSize))
+      if (this.taskPage > maxPage) this.taskPage = maxPage
       // 保存选择到 localStorage
       localStorage.setItem('selectedGroup', this.selectedGroup || '')
       // 刷新数据总览看板
@@ -1131,16 +1192,20 @@ createApp({
       if (this._pollTimer) return
       this._pollTimer = setInterval(async () => {
         await this.loadJobStatus()
-        if (!this.jobStatus.running) {
+        // 队列还有排队任务时继续轮询(worker 会自动衔接下一个), 全部跑完才收尾
+        if (!this.jobStatus.running && !(this.jobStatus.queue_len > 0)) {
           clearInterval(this._pollTimer); this._pollTimer = null
           this.stopTicking()
           await this.loadStats(); await this.loadTasks()
           if (this.view === 'task' && this.activeTaskId === this.jobStatus.task_id) await this.loadSessions()
           if (this.jobStatus.last_exit_code === 0) {
             ElementPlus.ElMessage.success(`采集完成，用时 ${this.jobStatus.last_duration_seconds}s`)
-          } else {
+          } else if (this.jobStatus.last_exit_code !== null && this.jobStatus.last_exit_code !== undefined) {
             ElementPlus.ElMessage.error('采集失败，详情见页面上方错误提示')
           }
+        } else {
+          // 采集中途也刷新任务列表, 让「排队中/采集中」标签实时更新(静默刷新, 不闪 loading 遮罩)
+          await this.loadTasks(true)
         }
       }, 1500)
     },
@@ -1250,7 +1315,7 @@ createApp({
 
   async mounted() {
     await Promise.all([this.loadTasks(), this.loadStats(), this.loadJobStatus()])
-    if (this.jobStatus.running) { this.startTicking(); this.startPollUntilDone() }
+    if (this.jobStatus.running || this.jobStatus.queue_len > 0) { this.startTicking(); this.startPollUntilDone() }
   },
 
   beforeUnmount() {
