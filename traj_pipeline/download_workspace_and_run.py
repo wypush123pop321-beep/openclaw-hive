@@ -329,6 +329,7 @@ def fetch_per_task_stats_files(obsutil, workspace_obs, origin, obs_cred_args=Non
     per_task = []
     got = 0
     done_n = 0
+    t_start = time.time()
     with ThreadPoolExecutor(max_workers=max(1, concurrency)) as ex:
         futs = {ex.submit(_fetch_one_task_stats, obsutil, t, origin, obs_cred_args,
                           with_task_done): t
@@ -339,9 +340,15 @@ def fetch_per_task_stats_files(obsutil, workspace_obs, origin, obs_cred_args=Non
             if entries:
                 got += 1
                 per_task.extend(entries)
-            # 逐 task 上报: 每完成一个都打一行, 让前端/终端能看到进度, 不再长时间静默
+            # 逐 task 上报: 每完成一个都打一行, 让前端/终端能看到进度, 不再长时间静默。
+            # 附实时速率(task/s, 按已用时均值) + 并发数 + 估算剩余时间(ETA)。
             if done_n % 5 == 0 or done_n == total:
-                print(f"      [fast] 进度 {done_n}/{total} (命中 {got})", flush=True)
+                elapsed = time.time() - t_start
+                rate = done_n / elapsed if elapsed > 0 else 0.0
+                eta = (total - done_n) / rate if rate > 0 else 0.0
+                print(f"      [fast] 进度 {done_n}/{total} (命中 {got}) | "
+                      f"{rate:.1f} task/s @ 并发 {concurrency} | ETA {eta/60:.1f} min",
+                      flush=True)
     if got == 0:
         return None
     print(f"      [fast] {got}/{total} 个 task 命中 logs/traj_stats_result.json", flush=True)

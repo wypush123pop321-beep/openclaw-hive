@@ -10,6 +10,7 @@ import tarfile
 import threading
 import time
 import uuid
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -90,7 +91,62 @@ _job_state = {
 }
 _LOG_TAIL_MAX = 40
 
+# ── 采集队列 ──────────────────────────────────────────────────────────────────
+# 连续登记/重新采集多个任务时, 按登记顺序排队, 由单一后台 worker 逐个下载(全局仍只有
+# 一个采集进程在跑, 与 _job_state 的单任务模型一致)。队列元素: {"task_id", "ssh_passwords"}。
+# ssh_passwords 只在内存里排队, 采集完即弃, 从不落盘(与既有一次性密码口径一致)。
+# _queue_cond 复用 _job_lock 作底层锁, 入队 notify、worker 空队列时 wait。
+_pipeline_queue = deque()
+_queue_cond = threading.Condition(_job_lock)
+
 _tasks_lock = threading.Lock()
+_stats_write_lock = threading.Lock()  # 串行化 filter_stats.json 的「读-改-写」, 防按需回填互相覆盖
+
+
+def _task_in_queue(task_id: str) -> bool:
+    """调用方需持有 _job_lock。"""
+    return any(it["task_id"] == task_id for it in _pipeline_queue)
+
+
+def _enqueue_pipeline(task_id: str, ssh_passwords: Optional[dict] = None) -> dict:
+    """把一个采集任务加入队列(按登记顺序). 返回:
+      {"state": "running"}            该任务正在采集中(重复触发)
+      {"state": "queued", "position": n}  已在队列中(重复) / 新入队, position 为队列中位次(1-based, 不含正在运行的那个)
+    """
+    with _job_lock:
+        if _job_state["running"] and _job_state["task_id"] == task_id:
+            return {"state": "running"}
+        if _task_in_queue(task_id):
+            pos = [it["task_id"] for it in _pipeline_queue].index(task_id) + 1
+            return {"state": "queued", "position": pos, "duplicate": True}
+        _pipeline_queue.append({"task_id": task_id, "ssh_passwords": ssh_passwords or {}})
+        pos = len(_pipeline_queue)
+        _queue_cond.notify()
+        return {"state": "queued", "position": pos}
+
+
+def _remove_from_queue(task_id: str) -> bool:
+    """从队列中移除一个尚未开始的任务(正在运行的不受影响)。移除成功返回 True。"""
+    with _job_lock:
+        kept = [it for it in _pipeline_queue if it["task_id"] != task_id]
+        removed = len(kept) < len(_pipeline_queue)
+        if removed:
+            _pipeline_queue.clear()
+            _pipeline_queue.extend(kept)
+        return removed
+
+
+def _pipeline_worker():
+    """单一后台 worker: 空队列时阻塞等待, 有任务则取队首逐个运行(严格 FIFO)。"""
+    while True:
+        with _job_lock:
+            while not _pipeline_queue:
+                _queue_cond.wait()
+            item = _pipeline_queue.popleft()
+        try:
+            run_pipeline(item["task_id"], item["ssh_passwords"])
+        except Exception as exc:   # 单个任务异常不拖垮 worker, 继续下一个
+            print(f"[queue] run_pipeline 异常 task_id={item['task_id']}: {exc}")
 
 
 def load_config() -> dict:
@@ -477,16 +533,36 @@ app = FastAPI(title="Trajectory Viewer")
 @app.on_event("startup")
 def _startup():
     migrate_legacy_task_if_needed()
+    # 单一采集 worker: 消费采集队列, 按登记顺序逐个下载
+    threading.Thread(target=_pipeline_worker, daemon=True).start()
     # 后台异步回填旧任务的 token_stats / task_done_count，避免阻塞 startup
     threading.Thread(target=_backfill_token_stats, daemon=True).start()
     threading.Thread(target=_backfill_task_done, daemon=True).start()
 
 
+def _acquire_per_task_for_backfill(task: dict) -> Optional[list]:
+    """为回填 char_len_stats/token_stats 拿到 per_task(逐条含 char_len/total_tokens)。
+
+    这两列(Estimated Tokens / Avg Char Len)只能由轨迹正文字符数算出, 唯一来源是本地 origin
+    下的轨迹文件经 traj_stats.process_root() 现算。老任务(走整包下载路径)本地有完整轨迹, 走这里
+    即可回填; fast 采集的任务本地无轨迹(只有 per-task logs/traj_stats_result.json, 其中无 char_len),
+    回填拿不到数据 -> 返回 None, 两列保持留空, 待用户按需下载轨迹时由
+    _ensure_workspace_session_files() 渐进补算。"""
+    origin = origin_dir(task["output_dir"])
+    if origin.is_dir() and any(origin.iterdir()):
+        per_task = traj_stats.process_root(str(origin))
+        if per_task:
+            return per_task
+    return None
+
+
 def _backfill_token_stats():
     """启动时回填旧任务的 token_stats/char_len_stats（新任务在 pipeline 阶段已写入）。
 
-    遍历所有已有 filter_stats.json 但缺 token_stats 或 char_len_stats 的任务，对 origin
-    目录重新调用 traj_stats.process_root() 提取 token/char_len 数据，计算各 tier 平均值后写回。
+    「Estimated Tokens(L1)」与「Avg Char Len(L1)」两列都取自 char_len_stats.L1, 很多旧任务
+    缺这一档。本函数对缺 L1 档的任务, 用本地轨迹重新聚合 per_task(见
+    _acquire_per_task_for_backfill), 计算各 tier 平均值后写回。fast 采集的任务本地无轨迹,
+    拿不到 char_len -> 跳过, 两列留空, 待按需下载轨迹时渐进补算。
     """
     tasks = load_tasks()
     updated = 0
@@ -499,15 +575,13 @@ def _backfill_token_stats():
                 data = json.load(f)
         except (json.JSONDecodeError, OSError):
             continue
-        if data.get("token_stats") and data.get("char_len_stats"):
-            continue                # 均已有, 跳过
+        ts0 = data.get("token_stats") or {}
+        cs0 = data.get("char_len_stats") or {}
+        if "L1" in cs0 and "L1" in ts0:
+            continue                # L1 档 token/char 均已有, 跳过(两列已可展示)
 
-        origin = origin_dir(t["output_dir"])
-        if not origin.is_dir():
-            continue
-
-        # 跑 traj_stats 提取 token/char_len
-        per_task = traj_stats.process_root(str(origin))
+        # 拿 per_task(优先复用采集侧 traj_stats_result.json, 见 _acquire_per_task_for_backfill)
+        per_task = _acquire_per_task_for_backfill(t)
         if not per_task:
             continue
 
@@ -864,18 +938,17 @@ def api_create_task(body: dict):
     tasks.append(task)
     save_tasks(tasks)
 
+    # 入队, 由单一 worker 按登记顺序逐个采集
+    enq = _enqueue_pipeline(task_id, ssh_passwords)
     with _job_lock:
-        already_running = _job_state["running"]
-    if already_running:
-        return {
-            "success": True,
-            "task": task,
-            "started": False,
-            "message": "任务已创建，但当前有其他任务正在采集中，请稍后在任务列表手动点击「重新采集」",
-        }
-
-    threading.Thread(target=run_pipeline, args=(task_id, ssh_passwords), daemon=True).start()
-    return {"success": True, "task": task, "started": True, "message": "任务已创建，正在采集数据"}
+        busy = _job_state["running"]
+    if not busy and enq.get("position") == 1:
+        return {"success": True, "task": task, "started": True, "queued": True,
+                "queue_position": 1, "message": "任务已创建，正在采集数据"}
+    pos = enq.get("position", 1)
+    return {"success": True, "task": task, "started": False, "queued": True,
+            "queue_position": pos,
+            "message": f"任务已创建，已加入采集队列（排在第 {pos} 位，将按登记顺序依次采集）"}
 
 
 @app.post("/api/tasks/{task_id}/trigger")
@@ -893,11 +966,18 @@ def api_trigger_task(task_id: str, body: dict = None):
             status_code=400,
         )
 
+    enq = _enqueue_pipeline(task_id, ssh_passwords)
+    if enq["state"] == "running":
+        return {"success": False, "message": "该任务正在采集中"}
     with _job_lock:
-        if _job_state["running"]:
-            return {"success": False, "message": "已有任务正在采集中，请稍候"}
-    threading.Thread(target=run_pipeline, args=(task_id, ssh_passwords), daemon=True).start()
-    return {"success": True, "message": "已开始采集"}
+        busy = _job_state["running"]
+    pos = enq.get("position", 1)
+    if enq.get("duplicate"):
+        return {"success": False, "message": f"该任务已在采集队列中（第 {pos} 位）"}
+    if not busy and pos == 1:
+        return {"success": True, "started": True, "queue_position": 1, "message": "已开始采集"}
+    return {"success": True, "started": False, "queue_position": pos,
+            "message": f"已加入采集队列（第 {pos} 位）"}
 
 
 @app.patch("/api/tasks/{task_id}")
@@ -925,6 +1005,7 @@ def api_delete_task(task_id: str):
                 status_code=409,
             )
 
+    _remove_from_queue(task_id)   # 若在采集队列里排队, 先出队再删数据
     delete_task_data(task["output_dir"])
     tasks = [t for t in load_tasks() if t["id"] != task_id]
     save_tasks(tasks)
@@ -967,6 +1048,19 @@ def api_stats():
     return summary
 
 
+def _get_session_level(s: dict) -> str:
+    """返回该会话的最高层级: L3 > L2 > L1.5 > L1 > L0。"""
+    if s.get("has_eval") and s.get("completion") == 1:
+        return "L3"
+    if s.get("has_eval") and isinstance(s.get("completion"), (int, float)) and s["completion"] >= 0.5:
+        return "L2"
+    if s.get("has_eval"):
+        return "L1.5"
+    if s.get("passed_gate"):
+        return "L1"
+    return "L0"
+
+
 @app.get("/api/tasks/{task_id}/sessions")
 def api_task_sessions(
     task_id: str,
@@ -974,6 +1068,7 @@ def api_task_sessions(
     page_size: int = 20,
     has_eval: Optional[bool] = None,
     completion_filter: Optional[str] = None,  # "ge05" | "eq1" | "no_eval"
+    level_filter: Optional[str] = None,       # "L0" / "L1" / "L1.5" / "L2" / "L3", 逗号分隔多选
 ):
     task = find_task(task_id)
     if not task:
@@ -995,6 +1090,20 @@ def api_task_sessions(
         sessions = [s for s in sessions if s.get("completion") == 1]
     elif completion_filter == "no_eval":
         sessions = [s for s in sessions if not s.get("has_eval")]
+
+    # 为每个会话计算层级并筛选
+    levels = set()
+    show_task_done = False
+    if level_filter:
+        parts = [l.strip() for l in level_filter.split(",")]
+        show_task_done = "TASK_DONE" in parts
+        levels = {l for l in parts if l in ("L0", "L1", "L1.5", "L2", "L3")}
+    for s in sessions:
+        s["level"] = _get_session_level(s)
+    if levels:
+        sessions = [s for s in sessions if s["level"] in levels]
+    if show_task_done:
+        sessions = [s for s in sessions if s.get("task_done")]
 
     total = len(sessions)
     start = (page - 1) * page_size
@@ -1384,6 +1493,79 @@ def _ensure_workspace_evaluator(task: dict, session: str) -> Optional[dict]:
     return _load_workspace_jsonl_trajectory(jsonl, session)
 
 
+# 任务 log 查看: 单个日志文件最大回传字节数(过大只回传尾部, 日志尾部通常含裁决/结论)。
+_LOG_MAX_BYTES = 2 * 1024 * 1024
+
+
+def _workspace_log_rel(task_dir: Path, session: str) -> str:
+    """该 session 主 log 的相对路径: 优先取 traj_stats_result.json 里的 log_file, 回退 logs/<session>.log。"""
+    tsr = task_dir / "logs" / "traj_stats_result.json"
+    if tsr.exists():
+        try:
+            with open(tsr, encoding="utf-8", errors="replace") as f:
+                lf = (json.load(f).get("log_file") or "").strip()
+            if lf and ".." not in lf and not lf.startswith("/"):
+                return lf
+        except (json.JSONDecodeError, OSError):
+            pass
+    return f"logs/{session}.log"
+
+
+def _ensure_workspace_log(task: dict, session: str) -> Optional[Path]:
+    """返回该 session 主 log 的本地路径; 本地无则用 workspace_obs 按需下载(懒加载)。
+    快速路径采集只留 traj_stats_result.json, log 需按需拉取。返回 None 表示无法获取。"""
+    output_dir = task["output_dir"]
+    if "/" in session or ".." in session:
+        return None
+    task_dir = origin_dir(output_dir) / session
+    rel = _workspace_log_rel(task_dir, session)
+    local = task_dir / rel
+    if local.exists():
+        return local
+    workspace_obs = (task.get("workspace_obs") or "").rstrip("/")
+    if not workspace_obs:
+        return None
+    cfg = load_config()
+    task_obs = f"{workspace_obs}/{session}/{rel}"
+    dest = str(task_dir / Path(rel).parent) + "/"
+    cmd = [cfg["obsutil_path"], "cp", task_obs, dest, "-f"] + _obs_cred_args_for_task(task)
+    try:
+        subprocess.run(cmd, capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", timeout=120)
+    except Exception:
+        return None
+    return local if local.exists() else None
+
+
+def _load_session_log_content(task: dict, session: str) -> Optional[dict]:
+    """读取本地已缓存的 session 主 log 内容(纯本地读, 不触发按需下载)。
+    _ensure_workspace_session_files 已拉下 *logs*.log, 此函数只做本地读取。"""
+    if "/" in session or ".." in session:
+        return None
+    task_dir = origin_dir(task["output_dir"]) / session
+    if not task_dir.is_dir():
+        return None
+    rel = _workspace_log_rel(task_dir, session)
+    log_path = task_dir / rel
+    if not log_path.exists():
+        return None
+    try:
+        size = log_path.stat().st_size
+        truncated = size > _LOG_MAX_BYTES
+        with open(log_path, "rb") as f:
+            if truncated:
+                f.seek(size - _LOG_MAX_BYTES)
+            raw = f.read()
+        text = raw.decode("utf-8", errors="replace")
+        if truncated:
+            nl = text.find("\n")
+            if nl >= 0:
+                text = text[nl + 1:]
+        return {"filename": log_path.name, "size": size, "truncated": truncated, "log": text}
+    except OSError:
+        return None
+
+
 # ── Hermes 来源(query1.json): 轨迹+评测同在一个文件, 无 agents/*/sessions ────────
 
 def _load_hermes_profile_session(json_path: Path, session: str) -> Optional[dict]:
@@ -1566,6 +1748,161 @@ def _read_hermes_state_db(task_dir: Path) -> Optional[dict]:
         return None
 
 
+# 详情页按需下载单个 session 所需文件时的 include/exclude(evaluator 仍独立懒加载, 此处不下)。
+# 与 download_workspace_and_run.py 的 INCLUDE_PATTERNS 对齐, 去掉 evaluator sessions。
+_SESSION_INCLUDE = [
+    "*assistant*sessions*.jsonl", "*agents/main/sessions/*.jsonl",
+    "*logs*.log",
+    "*logs/trajectories/*query*.json",
+    "*profiles/assistant*/sessions/*.json", "*profiles/main/sessions/*.json",
+    "*profiles/assistant*/state.db*",
+]
+_SESSION_EXCLUDE = ["*.trajectory.jsonl", "*_use.log", "*profiles/*/logs/*", "*_logs/*.log"]
+
+
+def _workspace_session_has_traj(task_dir: Optional[Path]) -> bool:
+    """本地是否已有该 session 的 assistant 轨迹(openclaw jsonl 或 Hermes query1/profiles)。"""
+    if not task_dir or not task_dir.is_dir():
+        return False
+    for pattern in ("agents/assistant*/sessions/*.jsonl", "agents/main/sessions/*.jsonl"):
+        for p in task_dir.glob(pattern):
+            if "trajectory" not in p.name:
+                return True
+    for pattern in ("logs/trajectories/*/query*.json",
+                    "profiles/assistant*/sessions/*.json", "profiles/main/sessions/*.json"):
+        if next(iter(task_dir.glob(pattern)), None) is not None:
+            return True
+    return False
+
+
+def _recompute_char_len_stats(data: dict) -> Optional[dict]:
+    """按 per_session 的 char_len 重新聚合各 tier 的平均字符数(供按需回填后刷新)。
+
+    tier 口径与 pipeline 的 stats_from_per_task 完全一致(每档都是上一档子集):
+      L0=全部, L1=passed_gate, L1.5=L1且有数值 completion, L2=L1.5且>=0.5,
+      L3=L1.5且==1, T_DONE=task_done。只统计已有 char_len 的会话(用户查看过详情的),
+      故 fast 采集任务是「渐进填充」——查看越多会话, 该均值覆盖面越大。全无 char_len 返回 None。
+    """
+    sessions = data.get("per_session") or []
+    tiers = {"L0": [], "L1": [], "L1.5": [], "L2": [], "L3": [], "T_DONE": []}
+    for s in sessions:
+        cl = s.get("char_len")
+        if not isinstance(cl, (int, float)):
+            continue
+        comp = s.get("completion")
+        has_eval = bool(s.get("has_eval"))
+        passed = bool(s.get("passed_gate"))
+        tiers["L0"].append(cl)
+        if s.get("task_done"):
+            tiers["T_DONE"].append(cl)
+        if passed:
+            tiers["L1"].append(cl)
+            if has_eval:
+                tiers["L1.5"].append(cl)
+                if isinstance(comp, (int, float)) and comp >= 0.5:
+                    tiers["L2"].append(cl)
+                if isinstance(comp, (int, float)) and comp == 1:
+                    tiers["L3"].append(cl)
+    out = {}
+    for tier, vals in tiers.items():
+        if vals:
+            total = sum(vals)
+            out[tier] = {"avg_char_len": round(total / len(vals)),
+                         "sum_total": total, "count": len(vals)}
+    return out or None
+
+
+def _backfill_session_char_len(task: dict, session: str) -> None:
+    """某 session 的轨迹文件已在本地时, 算出其 char_len 写回 filter_stats.json 并刷新 char_len_stats。
+
+    快速路径采集时两列(Estimated Tokens/Avg Char Len)留空, 用户查看某会话详情触发轨迹下载后,
+    在此就地补算该会话字符数并重聚合, 使两列渐进填上(与「按需算」设计一致)。
+    只处理 workspace 来源; 会话已有 char_len 或本地无轨迹文件时为 no-op。
+    """
+    if task.get("source_type") != "workspace":
+        return
+    sp = stats_path(task["output_dir"])
+    if not sp.exists():
+        return
+    origin = origin_dir(task["output_dir"])
+    with _stats_write_lock:
+        try:
+            with open(sp, encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return
+        sessions = data.get("per_session") or []
+        entry = next((s for s in sessions if s.get("session") == session), None)
+        if entry is None or isinstance(entry.get("char_len"), (int, float)):
+            return  # 无此会话 或 已回填过
+
+        # 定位轨迹文件: 优先用 per_session.trajectory(origin 相对路径), 兜底 glob 该 session 目录
+        traj_rel = entry.get("trajectory")
+        traj_path = None
+        if traj_rel:
+            cand = origin / traj_rel
+            if cand.is_file():
+                traj_path = cand
+        if traj_path is None:
+            sess_dir = origin / session
+            for pat in ("agents/*/sessions/*.jsonl", "logs/trajectories/*/query*.json",
+                        "profiles/*/sessions/*.json"):
+                for p in sess_dir.glob(pat):
+                    if "trajectory" not in p.name:
+                        traj_path = p
+                        break
+                if traj_path:
+                    break
+        if traj_path is None:
+            return  # 本地还没有该会话轨迹, 留待下次
+
+        entry["char_len"] = traj_stats._char_len(str(traj_path))
+        cs = _recompute_char_len_stats(data)
+        if cs:
+            data["char_len_stats"] = cs
+        try:
+            with open(sp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except OSError:
+            pass
+
+
+def _ensure_workspace_session_files(task: dict, session: str) -> None:
+    """确保单个 session 的 assistant 轨迹文件在本地; 缺失则从 workspace_obs 按需下载。
+
+    快速路径采集(见 download_workspace_and_run.py)只下 traj_stats_result.json, origin 下并无
+    具体轨迹文件, 首次查看详情时在此按需拉取该 session 的必要文件(不含 evaluator, 它另有懒加载)。
+    下载(或确认已存在)后就地补算该会话 char_len, 使 Estimated Tokens/Avg Char Len 两列渐进填上。
+    """
+    if "/" in session or ".." in session:
+        return
+    output_dir = task["output_dir"]
+    task_dir = origin_dir(output_dir) / session
+    if _workspace_session_has_traj(task_dir):
+        # 本地已有轨迹(本会话之前下过): 仍尝试补算 char_len(可能上次没算/是老缓存)
+        _backfill_session_char_len(task, session)
+        return
+    workspace_obs = (task.get("workspace_obs") or "").rstrip("/")
+    if not workspace_obs:
+        return
+    cfg = load_config()
+    task_obs = f"{workspace_obs}/{session}/"
+    origin = str(origin_dir(output_dir))
+    cmd = [cfg["obsutil_path"], "cp", task_obs, origin, "-r", "-f"]
+    for p in _SESSION_INCLUDE:
+        cmd += ["-include", p]
+    for p in _SESSION_EXCLUDE:
+        cmd += ["-exclude", p]
+    cmd += _obs_cred_args_for_task(task)
+    try:
+        subprocess.run(cmd, capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", timeout=180)
+    except Exception:
+        return
+    # 下载成功: 就地补算该会话 char_len 并刷新 char_len_stats
+    _backfill_session_char_len(task, session)
+
+
 @app.get("/api/tasks/{task_id}/session-detail/{session}")
 def api_task_session_detail(task_id: str, session: str, eval_qc: Optional[str] = None,
                             load_evaluator: Optional[int] = 0):
@@ -1574,6 +1911,8 @@ def api_task_session_detail(task_id: str, session: str, eval_qc: Optional[str] =
         return JSONResponse({"found": False, "message": "任务不存在"}, status_code=404)
 
     if task.get("source_type") == "workspace":
+        # 快速路径采集下 origin 无具体轨迹, 首次查看时按需下载该 session 的 assistant 文件
+        _ensure_workspace_session_files(task, session)
         assistant = _load_workspace_assistant(session, task["output_dir"])
         if assistant:
             # openclaw: 有 agents/*/sessions 事件流
@@ -1587,6 +1926,8 @@ def api_task_session_detail(task_id: str, session: str, eval_qc: Optional[str] =
                     # 把 log 裁决也挂到 evaluator 页, 复用 rubric 面板
                     evaluator["verdict"] = result["verdict"]
                 result["evaluator"] = evaluator
+            # C: 主 log 内容(已在 _ensure_workspace_session_files 下到本地), 前端直接秒开
+            result["task_log"] = _load_session_log_content(task, session)
             return result
 
         # Hermes: 无 sessions jsonl, 轨迹+评测都在 query1.json 里
@@ -1615,6 +1956,8 @@ def api_task_session_detail(task_id: str, session: str, eval_qc: Optional[str] =
             result["evaluator"] = evaluator
         else:
             result["evaluator"] = None
+        # C: 主 log 内容(已在 _ensure_workspace_session_files 下到本地)
+        result["task_log"] = _load_session_log_content(task, session)
         return result
 
     assistant = _load_simplified_trajectory(session, task["output_dir"])
@@ -1628,6 +1971,44 @@ def api_task_session_detail(task_id: str, session: str, eval_qc: Optional[str] =
         result["evaluator"] = evaluator  # 找不到时为 None, 前端据此隐藏 evaluator 标签页
 
     return result
+
+
+@app.get("/api/tasks/{task_id}/session-log/{session}")
+def api_task_session_log(task_id: str, session: str):
+    """返回该 session 的主 log 文本(与 assistant/evaluator 轨迹同级的「任务 Log」标签)。
+    workspace 来源: 本地无则从 workspace_obs 按需下载。过大只回传尾部 _LOG_MAX_BYTES 字节。"""
+    task = find_task(task_id)
+    if not task:
+        return JSONResponse({"found": False, "message": "任务不存在"}, status_code=404)
+    if task.get("source_type") != "workspace":
+        return JSONResponse({"found": False, "message": "该来源无独立 log 文件"}, status_code=404)
+
+    log_path = _ensure_workspace_log(task, session)
+    if not log_path or not log_path.exists():
+        return JSONResponse({"found": False, "message": "未找到该会话的 log 文件(可能无地址或下载失败)"},
+                            status_code=404)
+    try:
+        size = log_path.stat().st_size
+        truncated = size > _LOG_MAX_BYTES
+        with open(log_path, "rb") as f:
+            if truncated:
+                f.seek(size - _LOG_MAX_BYTES)
+            raw = f.read()
+        text = raw.decode("utf-8", errors="replace")
+        if truncated:
+            # 从第一个换行切齐, 避免半个多字节字符/半行
+            nl = text.find("\n")
+            if nl >= 0:
+                text = text[nl + 1:]
+    except OSError:
+        return JSONResponse({"found": False, "message": "读取 log 文件失败"}, status_code=500)
+    return {
+        "found": True,
+        "filename": log_path.name,
+        "size": size,
+        "truncated": truncated,
+        "log": text,
+    }
 
 
 def _iter_tar_stream(root_dir: Path, arcname: str, chunk_size: int = 1024 * 1024):
@@ -1698,9 +2079,25 @@ def api_job_status():
     with _job_lock:
         snap = dict(_job_state)
         snap["log_tail"] = list(_job_state["log_tail"])
+        queued_ids = [it["task_id"] for it in _pipeline_queue]
         # 不暴露进程对象到API响应
         snap.pop("process", None)
-        return snap
+    # 队列任务名映射放到锁外, 避免在 _job_lock 内做文件 I/O
+    id2name = {t["id"]: t.get("name") for t in load_tasks()}
+    snap["queue"] = [{"task_id": tid, "name": id2name.get(tid, tid)} for tid in queued_ids]
+    snap["queue_len"] = len(queued_ids)
+    return snap
+
+
+@app.post("/api/tasks/{task_id}/dequeue")
+def api_task_dequeue(task_id: str):
+    """把一个尚在排队(未开始)的任务移出采集队列。正在运行的请用「终止采集」。"""
+    with _job_lock:
+        if _job_state["running"] and _job_state["task_id"] == task_id:
+            return {"success": False, "message": "该任务正在采集中，请用「终止采集」"}
+    if _remove_from_queue(task_id):
+        return {"success": True, "message": "已移出采集队列"}
+    return {"success": False, "message": "该任务不在采集队列中"}
 
 
 @app.post("/api/job-stop")

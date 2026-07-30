@@ -98,6 +98,8 @@ body{
 }
 @keyframes spin{to{transform:rotate(360deg)}}
 .traj-viewer{margin-top:10px;max-height:65vh;overflow:auto;border:1px solid var(--border);border-radius:6px;background:var(--bg-0)}
+.log-panel{margin-top:10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-0)}
+.log-pre{margin:0;padding:12px;max-height:65vh;overflow:auto;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;line-height:1.5;color:var(--text-1);white-space:pre-wrap;word-break:break-word;background:var(--bg-0)}
 .traj-dialog{--el-dialog-width:90vw}.traj-dialog .el-dialog{max-width:1400px}.traj-dialog .el-dialog__body{max-height:80vh;overflow-y:auto}
 .traj-meta{font-size:11px;color:var(--text-2);padding:8px 12px;border-bottom:1px solid var(--border);position:sticky;top:0;background:var(--bg-0);display:flex;align-items:center;justify-content:space-between}
 .traj-toolbar{display:flex;gap:2px}
@@ -231,6 +233,8 @@ body{
       <div class="tbl-hdr">
         <div class="tbl-title">采集任务 <el-tag size="small" type="info">共 {{ filteredTasks.length }} 个</el-tag></div>
         <div style="display:flex;gap:8px;align-items:center">
+          <el-input v-model="taskSearch" placeholder="🔍 搜索任务名/分组/来源" clearable size="small"
+            style="width:220px" @input="onTaskSearch"></el-input>
           <span style="font-size:12px;color:var(--text-1)">按分组筛选:</span>
           <el-select v-model="selectedGroup" placeholder="全部任务" clearable size="small" style="width:180px" @change="onGroupChange">
             <el-option label="全部任务" value=""></el-option>
@@ -366,6 +370,14 @@ body{
             <el-option label="Completion ≥ 0.5" value="ge05"></el-option>
             <el-option label="Completion = 1" value="eq1"></el-option>
           </el-select>
+          <el-select v-model="levelFilter" placeholder="层级" clearable multiple collapse-tags size="small" style="width:160px" @change="onFilterChange">
+            <el-option label="L0（未过门槛）" value="L0"></el-option>
+            <el-option label="L1（过门槛）" value="L1"></el-option>
+            <el-option label="L1.5（有评测）" value="L1.5"></el-option>
+            <el-option label="L2（≥ 0.5）" value="L2"></el-option>
+            <el-option label="L3（= 1）" value="L3"></el-option>
+            <el-option label="TASK_DONE" value="TASK_DONE"></el-option>
+          </el-select>
           <el-select v-model="pageSize" size="small" style="width:90px" @change="onFilterChange">
             <el-option :value="10" label="10 / 页"></el-option>
             <el-option :value="20" label="20 / 页"></el-option>
@@ -378,7 +390,17 @@ body{
       <el-table :data="sessions" v-loading="loading" stripe border size="small"
         @row-click="openDetail" style="cursor:pointer;width:100%" :row-class-name="rowClass">
         <el-table-column type="index" width="50" label="#" align="center"></el-table-column>
-        <el-table-column prop="session" label="Session" min-width="220" show-overflow-tooltip></el-table-column>
+        <el-table-column prop="session" label="Session" min-width="150" show-overflow-tooltip></el-table-column>
+        <el-table-column label="标签" width="200">
+          <template #default="{row}">
+            <el-tag v-if="row.level === 'L0'" size="small" type="info" style="margin:1px 2px">L0</el-tag>
+            <el-tag v-else-if="row.level === 'L1'" size="small" style="margin:1px 2px">L1</el-tag>
+            <el-tag v-else-if="row.level === 'L1.5'" size="small" type="warning" style="margin:1px 2px">L1.5</el-tag>
+            <el-tag v-else-if="row.level === 'L2'" size="small" type="danger" style="margin:1px 2px">L2</el-tag>
+            <el-tag v-else-if="row.level === 'L3'" size="small" color="#722ed1" style="margin:1px 2px;color:#fff">L3</el-tag>
+            <el-tag v-if="row.task_done" size="small" type="success" style="margin:1px 2px">TASK_DONE</el-tag>
+          </template>
+        </el-table-column>
         <el-table-column label="评测" width="72" align="center">
           <template #default="{row}">
             <el-tag :type="row.has_eval?'success':'info'" size="small">{{ row.has_eval?'有':'无' }}</el-tag>
@@ -586,6 +608,10 @@ body{
           <div v-if="trajData.evaluator" class="traj-tab" :class="{active: trajTab==='evaluator'}" @click="trajTab='evaluator'">Evaluator 轨迹</div>
           <div v-else-if="selectedSession.eval_qc" class="traj-tab traj-tab-disabled">Evaluator 轨迹（未找到）</div>
         </template>
+        <!-- 任务 log: workspace 来源按需懒加载, 点击时才拉 -->
+        <div v-if="isWorkspaceTask" class="traj-tab" :class="{active: trajTab==='log'}" @click="onClickLogTab">
+          任务 Log<span v-if="logLoading"> …加载中</span>
+        </div>
       </div>
 
       <div v-if="trajTab === 'evaluator' && evalLoading" class="traj-loading">
@@ -616,7 +642,23 @@ body{
         <el-alert v-else type="info" :closable="false" show-icon title="未解析到该轮 evaluator 的逐条 rubric 裁决"></el-alert>
       </div>
 
-      <div v-if="trajLoaded && activeTrajData" class="traj-viewer">
+      <!-- 任务 Log 面板(点开任务自动加载; log 文件已在 fast pipeline 缓存或 session-detail 分发时下到本地) -->
+      <div v-if="trajTab === 'log'" class="log-panel">
+        <div v-if="logLoading" class="traj-loading">
+          <span class="traj-spinner"></span> 正在加载任务 log...
+        </div>
+        <el-alert v-if="logError" :title="logError" type="warning" show-icon :closable="false" style="margin-top:10px"></el-alert>
+        <template v-if="logData">
+          <div class="traj-meta">
+            <span>{{ logData.filename }} · {{ (logData.size/1024).toFixed(1) }} KB</span>
+            <span v-if="logData.truncated" style="color:var(--neon-orange,#e6a23c)">日志过大，仅显示尾部 2 MB</span>
+          </div>
+          <pre class="log-pre">{{ logData.log }}</pre>
+        </template>
+        <el-alert v-else-if="!logLoading && !logError" title="该会话无独立 log 文件" type="info" show-icon :closable="false" style="margin-top:10px"></el-alert>
+      </div>
+
+      <div v-if="trajTab !== 'log' && trajLoaded && activeTrajData" class="traj-viewer">
         <div class="traj-meta">
           <span>共 {{ activeTrajData.message_count }} 条消息{{ activeTrajData.model ? ' · 模型 ' + activeTrajData.model : '' }}</span>
           <span class="traj-toolbar">
@@ -670,6 +712,7 @@ createApp({
       activeTaskId: null,
       selectedGroup: localStorage.getItem('selectedGroup') || '学习生活',
       filteredTasks: [],
+      taskSearch: '',
       taskPage: 1,
       taskPageSize: 10,
 
@@ -708,6 +751,7 @@ createApp({
       currentPage: 1,
       pageSize: 20,
       completionFilter: '',
+      levelFilter: [],     // L0/L1/L1.5/L2/L3 层级筛选(多选)
       loading: false,
       jobStatus: {running: false, queue: [], queue_len: 0},
       selectedSession: null,
@@ -716,9 +760,12 @@ createApp({
       trajLoaded: false,
       trajError: '',
       trajData: null,
-      trajTab: 'assistant',
+      trajTab: 'log',  // 默认打开任务 Log 面板(优先展示全日志, 秒开)
       evalLoading: false,
       evalError: '',
+      logLoading: false,  // 任务 Log 懒加载状态
+      logError: '',
+      logData: null,      // {filename, size, truncated, log}
       msgCollapsed: {},   // 详情: 每块是否折叠, key = `${tab}:${i}`
       textExpanded: {},   // 详情: 长文本是否展开看全文, key = `${tab}:${i}:${kind}`
       _pollTimer: null,
@@ -843,7 +890,11 @@ createApp({
       if (!silent) this.tasksLoading = true
       try {
         const r = await axios.get('/api/tasks')
-        this.tasks = r.data.tasks
+        this.tasks = (r.data.tasks || []).sort((a, b) => {
+          // 按创建时间倒排(最新在最前), ISO 字符串可直接比较
+          const ta = a.created_at || '', tb = b.created_at || ''
+          return tb.localeCompare(ta)
+        })
         await this.loadAllGroups()
         this.filterTasksByGroup()
       } catch (e) { console.error('loadTasks', e) }
@@ -860,6 +911,7 @@ createApp({
         const p = { page: this.currentPage, page_size: this.pageSize }
         if (this.completionFilter === 'has_eval')  p.has_eval = true
         else if (['no_eval','ge05','eq1'].includes(this.completionFilter)) p.completion_filter = this.completionFilter
+        if (this.levelFilter && this.levelFilter.length) p.level_filter = this.levelFilter.join(',')
         const r = await axios.get(`/api/tasks/${this.activeTaskId}/sessions`, { params: p })
         this.sessions = r.data.sessions
         this.sessionsTotal = r.data.total
@@ -1149,14 +1201,34 @@ createApp({
       this.taskPage = 1
       this.filterTasksByGroup()
     },
+    onTaskSearch() {
+      // 关键字变化时回到第一页再筛选(轮询静默刷新不走这里, 保持当前页)
+      this.taskPage = 1
+      this.filterTasksByGroup()
+    },
     filterTasksByGroup() {
+      // 1) 先按分组筛
+      let list
       if (!this.selectedGroup) {
-        this.filteredTasks = this.tasks
+        list = this.tasks
       } else if (this.selectedGroup === '__ungroup__') {
-        this.filteredTasks = this.tasks.filter(t => !(t.groups && t.groups.length))
+        list = this.tasks.filter(t => !(t.groups && t.groups.length))
       } else {
-        this.filteredTasks = this.tasks.filter(t => (t.groups || []).includes(this.selectedGroup))
+        list = this.tasks.filter(t => (t.groups || []).includes(this.selectedGroup))
       }
+      // 2) 再按关键字筛(任务名 / 分组 / 数据来源 obs 路径, 不区分大小写)
+      const kw = (this.taskSearch || '').trim().toLowerCase()
+      if (kw) {
+        list = list.filter(t => {
+          const hay = [
+            t.name,
+            (t.groups || []).join(' '),
+            t.workspace_obs, t.assistant_obs, t.evaluator_obs,
+          ].filter(Boolean).join(' ').toLowerCase()
+          return hay.includes(kw)
+        })
+      }
+      this.filteredTasks = list
       // 筛选结果变化后, 若当前页超出范围则回到最后一页(避免停在空页)
       const maxPage = Math.max(1, Math.ceil(this.filteredTasks.length / this.taskPageSize))
       if (this.taskPage > maxPage) this.taskPage = maxPage
@@ -1171,6 +1243,7 @@ createApp({
       this.view = 'task'
       this.currentPage = 1
       this.completionFilter = ''
+      this.levelFilter = []
       this.sessions = []
       this.sessionsTotal = 0
       this.loadSessions()
@@ -1218,11 +1291,16 @@ createApp({
       this.trajLoaded = false
       this.trajError = ''
       this.trajData = null
-      this.trajTab = 'assistant'
+      this.trajTab = 'log'  // 默认展示日志面板(秒开)
       this.evalLoading = false
       this.evalError = ''
+      this.logLoading = false
+      this.logError = ''
+      this.logData = null
       this.msgCollapsed = {}
       this.textExpanded = {}
+      // workspace 任务: 点开即自动加载 log(文件已本地缓存), 无需点「查看具体轨迹」
+      if (this.isWorkspaceTask) this.loadTaskLog()
     },
     async loadTrajectory() {
       if (!this.selectedSession || !this.activeTaskId) return
@@ -1238,6 +1316,7 @@ createApp({
         if (r.data.found) {
           this.trajData = r.data
           this.trajLoaded = true
+          this.trajTab = 'assistant'  // 点「查看具体轨迹」后切换到 assistant 轨迹标签
         } else {
           this.trajError = r.data.message || '未找到轨迹数据'
         }
@@ -1271,6 +1350,31 @@ createApp({
       this.trajTab = 'evaluator'
       if (this.isWorkspaceTask && (!this.trajData || !this.trajData.evaluator)) {
         this.loadEvaluatorTrajectory()
+      }
+    },
+    // 任务 Log: 切换标签(内容已在 openDetail 时自动预加载); 未加载完成时显示 spinner
+    onClickLogTab() {
+      this.trajTab = 'log'
+      if (!this.logData && !this.logLoading) this.loadTaskLog()
+    },
+    async loadTaskLog() {
+      if (!this.selectedSession || !this.activeTaskId) return
+      this.logLoading = true
+      this.logError = ''
+      const sess = this.selectedSession.session
+      try {
+        const r = await axios.get(`/api/tasks/${this.activeTaskId}/session-log/${encodeURIComponent(sess)}`)
+        if (!this.selectedSession || this.selectedSession.session !== sess) return  // 会话切换保护
+        if (r.data.found) {
+          this.logData = r.data
+        } else {
+          this.logError = r.data.message || '未找到 log'
+        }
+      } catch (e) {
+        if (!this.selectedSession || this.selectedSession.session !== sess) return
+        this.logError = e.response?.data?.message || '加载 log 失败，请检查后端服务'
+      } finally {
+        if (!this.selectedSession || this.selectedSession.session === sess) this.logLoading = false
       }
     },
     // ── 详情折叠/展开 (#1 + #3) ──
