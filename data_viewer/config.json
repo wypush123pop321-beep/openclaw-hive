@@ -1,5 +1,10 @@
 {
   "output_base_dir": "./pipeline_output",
   "obsutil_path": "/home/w00802407/obsutil/obsutil",
-  "port": 8080
+  "port": 8080,
+  "sig_api_key": "",
+  "sig_base_url": "http://115.120.113.66:8082",
+  "sig_model": "tokenfly-01/claude-opus-4.8",
+  "sig_workers": 32,
+  "sig_max_signatures": 0
 }

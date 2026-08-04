@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import importlib.util
 import io
 import json
 import os
@@ -40,6 +41,13 @@ DEFAULT_CONFIG = {
     "output_base_dir": str(HERE / "pipeline_output"),
     "obsutil_path": "/home/w00802407/obsutil/obsutil",
     "port": 8080,
+    # signature 解码(reflect)用模型 API 配置。api_key 不落库(避免把能刷钱的凭证写进 git),
+    # 运行时按 config.sig_api_key > env SIG_API_KEY > data_viewer/sig_credentials.json(gitignored) 解析。
+    "sig_api_key": "",
+    "sig_base_url": "http://115.120.113.66:8082",
+    "sig_model": "tokenfly-01/claude-opus-4.8",
+    "sig_workers": 32,
+    "sig_max_signatures": 0,   # 0 = 解码全部; >0 时单次最多解码 N 条
 }
 
 def _merge_tier_stats(stats_list, avg_key):
@@ -121,6 +129,12 @@ _WS_DL_TTL = 3600           # 就绪后 1 小时未下载则清理临时目录
 # workspace」则是把该会话全量文件落进 <output_dir>/origin/<session>/, 供后续分析直接用。
 _wscache_lock = threading.Lock()
 _wscache_state = {}         # f"{task_id}/{session}" -> {running, error, finished_at}
+
+# ── signature 解码: 后台 reflect 还原完整 CoT ────────────────────────────────
+# reflect 每 signature 调一次模型 API, 耗时且花钱, 故全局单飞(任一会话在跑就不起新的),
+# 分阶段写 progress 供前端轮询显示。key = f"{task_id}/{session}"。
+_sigdecode_lock = threading.Lock()
+_sigdecode_state = {}       # key -> {running, phase, progress, total, error, done, cached, results}
 
 
 def _task_in_queue(task_id: str) -> bool:
@@ -2406,6 +2420,281 @@ def api_session_workspace_cache_status(task_id: str, session: str):
         if not st:
             return {"found": False}
         return {"found": True, "running": st.get("running"), "error": st.get("error")}
+
+
+# ── signature 解码(assistant 轨迹面板) ────────────────────────────────────────
+# 流程: 确保 trajectory.jsonl 已下载(复用「缓存全量 workspace」) ->
+#       traj_to_converted 转 pgml2 -> reflect 模型 API 还原完整 CoT ->
+#       结果含 base64 解码信息 + 还原 CoT, 供前端对比展示。
+
+def _find_session_trajectories(task: dict, session: str) -> list:
+    """找该会话 origin 下真正执行任务的 *.trajectory.jsonl(main + assistant*)。"""
+    sess_dir = origin_dir(task["output_dir"]) / session
+    out = []
+    for pat in ("agents/main/sessions/*.trajectory.jsonl",
+                "agents/assistant*/sessions/*.trajectory.jsonl"):
+        out.extend(sorted(sess_dir.glob(pat)))
+    return out
+
+
+def _sigdecode_workdir(task: dict, session: str) -> Path:
+    """解码产物目录(转换/反射 jsonl), 不污染 origin。"""
+    return Path(task["output_dir"]) / "_sigdecode" / session
+
+
+def _load_pipeline_module(name: str, path):
+    """按文件路径动态加载 pipeline 脚本模块(不改动 server 命名空间依赖)。"""
+    spec = importlib.util.spec_from_file_location(name, str(path))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _count_signatures(converted_file: Path) -> int:
+    """converted pgml2 里带 signature 的 assistant 消息数(即待反射条数)。"""
+    n = 0
+    with open(converted_file, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            for msg in obj.get("messages", []):
+                if msg.get("signature"):
+                    n += 1
+    return n
+
+
+def _parse_reflect_results(reflected_file: Path) -> list:
+    """解析 reflected.jsonl, 收集所有已反射(解码)的 assistant 消息, 供前端对比。"""
+    results = []
+    if not reflected_file.exists():
+        return results
+    with open(reflected_file, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            sidx = obj.get("_sample_idx")
+            for midx, msg in enumerate(obj.get("messages", [])):
+                if not msg.get("reasoning_content_reflected"):
+                    continue
+                results.append({
+                    "sample_idx": sidx,
+                    "message_idx": midx,
+                    "signature": msg.get("signature", ""),
+                    "signature_info": msg.get("signature_info", ""),
+                    "thinking_summary": msg.get("thinking_summary", ""),
+                    "reasoning_content": msg.get("reasoning_content", ""),
+                    "content": msg.get("content", ""),
+                    "reflection_quality": msg.get("reflection_quality", ""),
+                    "length_diff": msg.get("length_diff", ""),
+                })
+    return results
+
+
+def _load_sig_credentials() -> dict:
+    """读取本地签名解码凭证(gitignored, 不提交): {"api_key": "..."}。"""
+    p = HERE / "sig_credentials.json"
+    if not p.exists():
+        return {}
+    try:
+        with open(p, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _resolve_sig_api_key() -> str:
+    """签名解码用模型 API key, 优先级: config.sig_api_key > env SIG_API_KEY > sig_credentials.json。"""
+    cfg = load_config()
+    k = (cfg.get("sig_api_key") or "").strip()
+    if not k:
+        k = os.environ.get("SIG_API_KEY", "").strip()
+    if not k:
+        k = (_load_sig_credentials().get("api_key") or "").strip()
+    return k
+
+
+def _run_signature_decode(task: dict, session: str, key: str, force: bool, limit: Optional[int] = None):
+    """后台线程: 下载轨迹(如需) -> 转换 pgml2 -> reflect 解码 -> 整理结果。
+    limit: 单次最多解码条数(优先于 config.sig_max_signatures, 供测试/控制花费)。"""
+    workdir = _sigdecode_workdir(task, session)
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    def _set(**kw):
+        with _sigdecode_lock:
+            _sigdecode_state.setdefault(key, {})
+            _sigdecode_state[key].update(kw)
+
+    try:
+        # 阶段 1: 确保 trajectory.jsonl 已下载(本地无则复用缓存 workspace 拉全量)
+        _set(phase="download", progress=0, total=0, error=None, done=False, cached=False, results=None)
+        trajs = _find_session_trajectories(task, session)
+        if not trajs:
+            _cache_session_workspace(task, session, key)
+            trajs = _find_session_trajectories(task, session)
+        if not trajs:
+            _set(phase="error", error="该会话无 trajectory.jsonl(OBS 里可能没有工作轨迹), 无法解码")
+            return
+
+        # 阶段 2: trajectory -> pgml2(traj_to_converted, 自动只收 main/assistant* 轨迹,
+        #         并用同目录 compact jsonl 补 messagesSnapshot 缺口)
+        _set(phase="convert", progress=0, total=0)
+        stem = re.sub(r"[^\w\-.]", "_", session)
+        conv_path = HERE / "pipeline" / "workspace_to_pangu" / "traj_to_converted.py"
+        conv = _load_pipeline_module("traj_to_converted", conv_path)
+        old_argv = sys.argv[:]
+        sys.argv = [str(conv_path),
+                    "--traj-in", str(origin_dir(task["output_dir"]) / session),
+                    "--out", str(workdir / f"{stem}_converted.jsonl")]
+        try:
+            conv.main()
+        finally:
+            sys.argv = old_argv
+
+        main_out = workdir / f"{stem}_converted.jsonl"
+        fold_out = workdir / f"{stem}_converted_fold.jsonl"
+        trunc_out = workdir / f"{stem}_converted_truncated.jsonl"
+        parts = [p for p in (main_out, fold_out, trunc_out) if p.exists()]
+        if not parts:
+            _set(phase="error", error="trajectory 转换失败, 未生成 converted.jsonl")
+            return
+        # 合并所有分段(compaction fold / 截断 tail), 重排 _sample_idx 保证 reflect 断点 key 全局唯一
+        converted_for_reflect = workdir / f"{stem}_combined.jsonl"
+        merged = 0
+        with open(converted_for_reflect, "w", encoding="utf-8") as fout:
+            for p in parts:
+                with open(p, encoding="utf-8") as fin:
+                    for line in fin:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        obj["_sample_idx"] = merged
+                        merged += 1
+                        fout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+        # 阶段 3: reflect 解码(模型 API; 已有结果则复用缓存)
+        reflected = workdir / f"{stem}_reflected.jsonl"
+        used_cache = reflected.exists() and not force
+        if used_cache:
+            _set(phase="done", progress=0, total=0, done=True, cached=True)
+        else:
+            if force and reflected.exists():
+                reflected.unlink()
+            total_sigs = _count_signatures(converted_for_reflect)
+            if total_sigs == 0:
+                _set(phase="done", progress=0, total=0, done=True, cached=False)
+            else:
+                cfg = load_config()
+                if limit is None:
+                    max_sig = int(cfg.get("sig_max_signatures") or 0)
+                    limit = max_sig if max_sig > 0 else None
+                _set(phase="reflect", progress=0, total=total_sigs, cached=False)
+
+                mod = _load_pipeline_module("reflect_0731openclaw_cot",
+                                            HERE / "pipeline" / "reflect_0731openclaw_cot.py")
+                mod.API_KEY = _resolve_sig_api_key() or mod.API_KEY
+                mod.BASE_URL = (cfg.get("sig_base_url") or "").strip() or mod.BASE_URL
+                mod.MODEL = (cfg.get("sig_model") or "").strip() or mod.MODEL
+                orig_log = mod.log
+
+                def _progress_log(msg: str):
+                    m = re.search(r"progress (\d+)/(\d+)", msg)
+                    if m:
+                        _set(progress=int(m.group(1)), total=int(m.group(2)))
+                    orig_log(msg)
+
+                mod.log = _progress_log
+                try:
+                    mod.run(
+                        input_file=converted_for_reflect,
+                        output_file=reflected,
+                        workers=int(cfg.get("sig_workers") or 32),
+                        limit=limit,
+                        flush_interval=50,
+                        max_tokens=32768,
+                        stream=False,
+                    )
+                finally:
+                    mod.log = orig_log
+
+        # 阶段 4: 整理结果
+        results = _parse_reflect_results(reflected)
+        _set(phase="done", progress=len(results), total=len(results),
+             done=True, cached=used_cache, results=results)
+    except SystemExit as e:
+        _set(phase="error", error=f"转换脚本退出: {e}")
+    except Exception as e:
+        _set(phase="error", error=f"{type(e).__name__}: {e}")
+    finally:
+        with _sigdecode_lock:
+            st = _sigdecode_state.get(key)
+            if st:
+                st["running"] = False
+
+
+@app.post("/api/tasks/{task_id}/session-detail/{session}/signature-decode")
+def api_signature_decode_start(task_id: str, session: str, force: int = 0, limit: Optional[int] = None):
+    """触发 signature 解码(后台任务, 前端轮询 status)。全局单飞防并发打爆模型 API。
+    limit: 单次最多解码条数(优先于 config.sig_max_signatures)。"""
+    task = find_task(task_id)
+    if not task:
+        return JSONResponse({"success": False, "message": "任务不存在"}, status_code=404)
+    if task.get("source_type") != "workspace":
+        return JSONResponse({"success": False, "message": "仅 workspace 来源的任务支持 signature 解码"},
+                            status_code=400)
+    if not session or "/" in session or ".." in session:
+        return JSONResponse({"success": False, "message": "非法 session"}, status_code=400)
+    key = f"{task_id}/{session}"
+    with _sigdecode_lock:
+        st = _sigdecode_state.get(key)
+        if st and st.get("running"):
+            return {"success": True, "running": True, "message": "该会话 signature 解码进行中"}
+        for k, other in _sigdecode_state.items():
+            if other.get("running"):
+                return JSONResponse({"success": False, "running": True,
+                                     "message": "已有其他会话的解码任务在运行, 请稍后再试"}, status_code=409)
+        _sigdecode_state[key] = {"running": True, "phase": "start", "progress": 0, "total": 0,
+                                 "error": None, "done": False, "cached": False, "results": None}
+    threading.Thread(target=_run_signature_decode, args=(task, session, key, bool(force), limit),
+                     daemon=True).start()
+    return {"success": True, "running": True, "message": "已开始 signature 解码"}
+
+
+@app.get("/api/tasks/{task_id}/session-detail/{session}/signature-decode/status")
+def api_signature_decode_status(task_id: str, session: str):
+    """前端轮询: {found, running, phase, progress, total, error, done, cached}。"""
+    key = f"{task_id}/{session}"
+    with _sigdecode_lock:
+        st = _sigdecode_state.get(key)
+        if not st:
+            return {"found": False}
+        return {"found": True, "running": st.get("running"), "phase": st.get("phase"),
+                "progress": st.get("progress", 0), "total": st.get("total", 0),
+                "error": st.get("error"), "done": st.get("done", False), "cached": st.get("cached", False)}
+
+
+@app.get("/api/tasks/{task_id}/session-detail/{session}/signature-decode/result")
+def api_signature_decode_result(task_id: str, session: str):
+    """解码完成后取结果列表。"""
+    key = f"{task_id}/{session}"
+    with _sigdecode_lock:
+        st = _sigdecode_state.get(key)
+        if not st or not st.get("done"):
+            return JSONResponse({"success": False, "message": "解码尚未完成"}, status_code=409)
+        return {"success": True, "results": st.get("results") or []}
 
 
 @app.get("/api/job-status")

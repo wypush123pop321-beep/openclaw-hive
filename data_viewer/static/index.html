@@ -131,6 +131,30 @@ body{
 .traj-sig-text{flex:1;min-width:0}
 .traj-sig-copy{flex-shrink:0;font-size:10px;color:var(--text-1);border:1px solid var(--border);border-radius:3px;padding:0 4px}
 .traj-sig-copy.copied{color:var(--neon-green);border-color:rgba(0,255,168,.4)}
+/* signature 解码: 工具栏 + 对比面板 */
+.sig-toolbar{display:flex;align-items:center;gap:10px;margin-top:10px;padding:8px 10px;background:var(--bg-1);border:1px solid var(--border);border-radius:6px;flex-wrap:wrap}
+.sig-hint{font-size:11px;color:var(--text-2)}
+/* 内嵌折叠的解码结果(位于每条消息 signature 展示框下方) */
+.traj-decode-block{margin-top:6px}
+.traj-decode-toggle{display:flex;align-items:center;gap:4px;font-size:12px;color:var(--neon-amber);cursor:pointer;user-select:none;padding:3px 0;font-family:ui-monospace,monospace}
+.traj-decode-toggle:hover{color:#ffd977}
+.traj-decode-body{margin-top:4px;display:flex;flex-direction:column;gap:8px}
+.sig-card{border:1px solid var(--border);border-radius:6px;background:var(--bg-1);padding:10px;margin-bottom:10px}
+.sig-card-head{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:8px}
+.sig-card-title{font-family:ui-monospace,monospace;font-size:12px;color:var(--neon-cyan);font-weight:600;margin-right:6px}
+.sig-sig-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px;font-family:ui-monospace,monospace;font-size:11px}
+.sig-sig-chip{color:var(--neon-amber);background:rgba(255,194,60,.07);border:1px solid rgba(255,194,60,.35);border-radius:4px;padding:2px 6px;cursor:pointer;word-break:break-all;user-select:none}
+.sig-sig-chip:hover{background:rgba(255,194,60,.14)}
+.sig-info{color:var(--text-2);word-break:break-all;cursor:help}
+.sig-content{font-size:12px;color:var(--text-0);margin-bottom:8px;white-space:pre-wrap;word-break:break-word}
+.sig-compare{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.sig-col{border:1px solid var(--border);border-radius:6px;background:var(--bg-0);overflow:hidden;min-width:0}
+.sig-col-title{font-size:11px;font-weight:700;padding:5px 8px;background:var(--bg-2);color:var(--text-1);border-bottom:1px solid var(--border)}
+.sig-col-body{font-size:12px;line-height:1.7;padding:8px;white-space:pre-wrap;word-break:break-word;max-height:42vh;overflow:auto}
+.sig-orig{color:var(--text-2);font-style:italic}
+.sig-decoded{color:var(--text-0)}
+.sig-decoded.highlight{color:#c9f2e0;background:rgba(0,255,168,.05)}
+@media (max-width:1100px){.sig-compare{grid-template-columns:1fr}}
 .traj-content{color:var(--text-0);white-space:pre-wrap;word-break:break-word}
 .traj-cut{color:var(--neon-amber);font-size:11px}
 .traj-toolcalls{margin-top:6px;display:flex;flex-direction:column;gap:4px}
@@ -682,6 +706,23 @@ body{
         </div>
       </div>
 
+      <!-- signature 解码: 工具栏(Assistant 轨迹面板, 仅 workspace); 结果内嵌在各消息 signature 展示框下方 -->
+      <div v-if="isWorkspaceTask && trajLoaded && trajTab === 'assistant'" class="sig-toolbar">
+        <template v-if="sigDecodeRunning">
+          <span class="traj-spinner"></span>
+          <span>signature 解码中: <template v-if="sigDecodePhase === 'reflect'">解码 {{ sigDecodeProgress }}/{{ sigDecodeTotal }}</template><template v-else>{{ sigPhaseLabel(sigDecodePhase) }}</template>…</span>
+        </template>
+        <template v-else-if="sigDecodeResults.length">
+          <span style="color:var(--neon-green)">✅ 已解码 {{ sigDecodeResults.length }} 条 signature<template v-if="sigDecodeCached">（复用缓存）</template></span>
+          <span class="sig-hint">展开各消息「signature 解码结果」查看对比</span>
+          <el-button size="small" @click="forceSigDecode">重新解码</el-button>
+        </template>
+        <template v-else>
+          <el-button size="small" type="warning" @click="startSigDecode()">🧠 signature 解码</el-button>
+          <span class="sig-hint">调用模型 API 把 thinkingSignature 解码成完整 CoT，与原始截断摘要对比（耗时几分钟）</span>
+        </template>
+      </div>
+
       <div v-if="trajTab === 'evaluator' && evalLoading" class="traj-loading">
         <span class="traj-spinner"></span> 正在按需下载 evaluator 轨迹...
       </div>
@@ -781,6 +822,38 @@ body{
                 <div v-for="(s, si) in m.thinking_signatures" :key="si" class="traj-sig-chip" :title="s" @click="copySig(i, si)">
                   <span class="traj-sig-text">{{ displaySig(s) }}</span>
                   <span class="traj-sig-copy" :class="{copied: isSigCopied(i, si)}">{{ isSigCopied(i, si) ? '✓ 已复制' : '📋 复制' }}</span>
+                </div>
+              </div>
+              <!-- signature 解码结果: 内嵌对比, 按签名与当前消息匹配 -->
+              <div v-if="decodeResultsForMsg(m).length" class="traj-decode-block">
+                <div class="traj-decode-toggle" @click="toggleMsgDecode(i)">
+                  <span class="traj-caret">{{ isMsgDecodeOpen(i) ? '▼' : '▶' }}</span>
+                  signature 解码结果 ({{ decodeResultsForMsg(m).length }})
+                </div>
+                <div v-if="isMsgDecodeOpen(i)" class="traj-decode-body">
+                  <div v-for="(r, ri) in decodeResultsForMsg(m)" :key="ri" class="sig-card">
+                    <div class="sig-card-head">
+                      <el-tag v-if="r.reflection_quality === 'good'" size="small" type="success">✅ good</el-tag>
+                      <el-tag v-else-if="r.reflection_quality === 'suspicious_greeting'" size="small" type="warning">⚠️ greeting</el-tag>
+                      <el-tag v-else-if="r.reflection_quality === 'suspicious_hallucination'" size="small" type="danger">❌ hallucination</el-tag>
+                      <el-tag v-else-if="r.reflection_quality" size="small" type="info">{{ r.reflection_quality }}</el-tag>
+                      <el-tag :type="r.length_diff === 'valid' ? 'success' : 'danger'" size="small">{{ r.length_diff }}</el-tag>
+                    </div>
+                    <div class="sig-sig-row">
+                      <span class="sig-sig-chip" :title="r.signature" @click="copyText(r.signature)">signature: {{ displaySig(r.signature) }}</span>
+                      <span v-if="r.signature_info" class="sig-info" :title="r.signature_info" @click="copyText(r.signature_info)">base64解码: {{ displaySig(r.signature_info) }}</span>
+                    </div>
+                    <div class="sig-compare">
+                      <div class="sig-col">
+                        <div class="sig-col-title">原始 thinking 摘要</div>
+                        <div class="sig-col-body sig-orig">{{ displayText(r.thinking_summary, 'd' + i + '_' + ri, 'o') }}<span v-if="isLong(r.thinking_summary)" class="traj-more" @click="toggleText('d' + i + '_' + ri, 'o')">{{ isTextExpanded('d' + i + '_' + ri, 'o') ? ' 收起 ▲' : ' …展开看全文 ▼' }}</span></div>
+                      </div>
+                      <div class="sig-col">
+                        <div class="sig-col-title">解码还原完整 CoT</div>
+                        <div class="sig-col-body sig-decoded highlight">{{ displayText(r.reasoning_content, 'd' + i + '_' + ri, 'd') }}<span v-if="isLong(r.reasoning_content)" class="traj-more" @click="toggleText('d' + i + '_' + ri, 'd')">{{ isTextExpanded('d' + i + '_' + ri, 'd') ? ' 收起 ▲' : ' …展开看全文 ▼' }}</span></div>
+                      </div>
+                    </div>
+                  </div>
                 </div>
               </div>
               <div v-if="m.content" class="traj-content">
@@ -883,6 +956,14 @@ createApp({
       textExpanded: {},   // 详情: 长文本是否展开看全文, key = `${tab}:${i}:${kind}`
       sigCopied: {},      // 详情: thinkingSignature 复制反馈, key = `${tab}:${i}:sig${si}`
       _sigCopiedTimer: null,
+      sigDecodeRunning: false,  // 解码任务进行中
+      sigDecodePhase: '',       // start/download/convert/reflect/done/error
+      sigDecodeProgress: 0,
+      sigDecodeTotal: 0,
+      sigDecodeError: '',
+      sigDecodeCached: false,
+      sigDecodeResults: [],     // [{sample_idx, message_idx, signature, signature_info, thinking_summary, reasoning_content, content, reflection_quality, length_diff}]
+      msgDecodeOpen: {},        // 每条消息的解码结果是否展开, key = `${tab}:${i}`
       _pollTimer: null,
       _tickTimer: null,
       nowTick: Date.now(),
@@ -1526,6 +1607,14 @@ createApp({
       this.msgCollapsed = {}
       this.textExpanded = {}
       this.sigCopied = {}
+      this.sigDecodeRunning = false
+      this.sigDecodePhase = ''
+      this.sigDecodeProgress = 0
+      this.sigDecodeTotal = 0
+      this.sigDecodeError = ''
+      this.sigDecodeCached = false
+      this.sigDecodeResults = []
+      this.msgDecodeOpen = {}
       // workspace 任务: 点开即自动加载 log(文件已本地缓存), 无需点「查看具体轨迹」
       if (this.isWorkspaceTask) this.loadTaskLog()
     },
@@ -1647,6 +1736,102 @@ createApp({
           this.sigCopied = { ...this.sigCopied, [k]: false }
         }, 1500)
       }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(s).then(done).catch(() => {})
+      } else {
+        const ta = document.createElement('textarea')
+        ta.value = s
+        ta.style.position = 'fixed'
+        ta.style.opacity = '0'
+        document.body.appendChild(ta)
+        ta.select()
+        try { document.execCommand('copy'); done() } catch (e) {}
+        document.body.removeChild(ta)
+      }
+    },
+    // ── signature 解码: 触发 / 轮询 / 结果 ──
+    sigPhaseLabel(phase) {
+      return { start: '启动', download: '下载轨迹', convert: '转换格式', reflect: '解码', done: '完成', error: '失败' }[phase] || phase || ''
+    },
+    async startSigDecode(force = false) {
+      if (!this.selectedSession || !this.activeTaskId || this.sigDecodeRunning) return
+      const s = this.selectedSession.session
+      const base = `/api/tasks/${this.activeTaskId}/session-detail/${encodeURIComponent(s)}/signature-decode`
+      try {
+        const r = await axios.post(base, null, { params: { force: force ? 1 : 0 } })
+        if (r.data.error) throw new Error(r.data.message || r.data.error)
+        this.sigDecodeRunning = true
+        this.sigDecodePhase = 'start'
+        this.sigDecodeProgress = 0
+        this.sigDecodeTotal = 0
+        this.sigDecodeError = ''
+        this.sigDecodeResults = []
+        this.pollSigDecode()
+      } catch (e) {
+        const msg = e.response?.data?.detail || e.response?.data?.message || e.message || '请稍后重试'
+        ElementPlus.ElMessage.error('解码失败: ' + msg)
+      }
+    },
+    async pollSigDecode() {
+      if (!this.selectedSession || !this.activeTaskId) return
+      const s = this.selectedSession.session
+      const base = `/api/tasks/${this.activeTaskId}/session-detail/${encodeURIComponent(s)}/signature-decode`
+      const deadline = Date.now() + 65 * 60 * 1000
+      try {
+        while (Date.now() < deadline) {
+          // 会话已切换, 放弃本次轮询
+          if (!this.selectedSession || this.selectedSession.session !== s) { this.sigDecodeRunning = false; return }
+          const st = await axios.get(base + '/status')
+          const d = st.data
+          if (!d.found) { this.sigDecodeRunning = false; return }
+          this.sigDecodePhase = d.phase || ''
+          this.sigDecodeProgress = d.progress || 0
+          this.sigDecodeTotal = d.total || 0
+          this.sigDecodeCached = !!d.cached
+          if (d.error) throw new Error(d.error)
+          if (d.done) {
+            this.sigDecodeRunning = false
+            await this.loadSigDecodeResult()
+            return
+          }
+          await new Promise(res => setTimeout(res, 2000))
+        }
+        this.sigDecodeRunning = false
+        ElementPlus.ElMessage.error('解码超时, 请重试')
+      } catch (e) {
+        this.sigDecodeRunning = false
+        const msg = e.message || e.response?.data?.message || '解码失败'
+        this.sigDecodeError = msg
+        ElementPlus.ElMessage.error('解码失败: ' + msg)
+      }
+    },
+    async loadSigDecodeResult() {
+      if (!this.selectedSession || !this.activeTaskId) return
+      const s = this.selectedSession.session
+      const base = `/api/tasks/${this.activeTaskId}/session-detail/${encodeURIComponent(s)}/signature-decode`
+      try {
+        const r = await axios.get(base + '/result')
+        if (this.selectedSession && this.selectedSession.session !== s) return
+        this.sigDecodeResults = r.data.results || []
+        this.msgDecodeOpen = {}  // 新结果: 默认全部折叠
+      } catch (e) {
+        ElementPlus.ElMessage.error('获取解码结果失败: ' + (e.response?.data?.message || e.message))
+      }
+    },
+    forceSigDecode() { this.startSigDecode(true) },
+    // 按 signature 把解码结果匹配回当前轨迹消息(同一条签名), 返回该消息命中的解码结果
+    decodeResultsForMsg(m) {
+      if (!m || !m.thinking_signatures || !m.thinking_signatures.length || !this.sigDecodeResults) return []
+      return this.sigDecodeResults.filter(r => m.thinking_signatures.includes(r.signature))
+    },
+    isMsgDecodeOpen(i) { return !!this.msgDecodeOpen[this.trajTab + ':' + i] },
+    toggleMsgDecode(i) {
+      const k = this.trajTab + ':' + i
+      this.msgDecodeOpen = { ...this.msgDecodeOpen, [k]: !this.msgDecodeOpen[k] }
+    },
+    async copyText(s) {
+      if (typeof s !== 'string' || !s) return
+      const done = () => ElementPlus.ElMessage.success('已复制')
       if (navigator.clipboard && navigator.clipboard.writeText) {
         navigator.clipboard.writeText(s).then(done).catch(() => {})
       } else {
