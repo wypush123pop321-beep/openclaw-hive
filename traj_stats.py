@@ -414,6 +414,107 @@ def analyze_query1(path):
     }
 
 
+# ── 工具调用失败统计(显式错误标记口径) ─────────────────────────────────────────
+# 只认「结构化的显式错误标记」, 不做关键字扫描(正文出现 error/异常 不计), 以避免误报:
+#   - openclaw: assistant .jsonl 里 role=="toolResult" 的 message, isError==True 或
+#               details.exitCode 为非 0 整数, 即该次工具调用失败。
+#   - Hermes  : query1.json 的 turns[].tool_calls[].output(JSON 对象)命中 ok:false /
+#               truthy error / success:false / exit_code|returncode 非 0 整数, 即失败。
+# 无显式标记的工具(如 exec 纯文本 stdout)其失败不计入 —— 符合「仅显式标记」口径。
+
+def _toolcall_output_is_error(output) -> bool:
+    """Hermes 单次 tool_call 的 output 是否为显式失败。output 多为 JSON 字符串。"""
+    obj = output
+    if isinstance(output, str):
+        s = output.strip()
+        if not s or s[:1] not in "{[":
+            return False
+        try:
+            obj = json.loads(s)
+        except json.JSONDecodeError:
+            return False
+    if not isinstance(obj, dict):
+        return False
+    if obj.get("ok") is False or obj.get("success") is False:
+        return True
+    if obj.get("error"):
+        return True
+    for k in ("exit_code", "returncode"):
+        v = obj.get(k)
+        if isinstance(v, int) and not isinstance(v, bool) and v != 0:
+            return True
+    return False
+
+
+def _toolresult_msg_is_error(msg) -> bool:
+    """openclaw 单条 role=='toolResult' 的 message 是否为显式失败。"""
+    if not isinstance(msg, dict):
+        return False
+    if msg.get("isError"):
+        return True
+    details = msg.get("details")
+    if isinstance(details, dict):
+        code = details.get("exitCode")
+        if isinstance(code, int) and not isinstance(code, bool) and code != 0:
+            return True
+    return False
+
+
+def count_tool_failures_openclaw(jsonl_path):
+    """遍历 openclaw assistant .jsonl(message 事件流), 返回 (tool_calls, tool_fails)。
+    tool_calls = assistant 消息里 toolCall 部件总数; tool_fails = 显式失败的 toolResult 数。"""
+    tool_calls = 0
+    tool_fails = 0
+    try:
+        with open(jsonl_path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("type") != "message":
+                    continue
+                msg = obj.get("message") or {}
+                role = msg.get("role")
+                if role == "assistant":
+                    content = msg.get("content")
+                    if isinstance(content, list):
+                        tool_calls += sum(
+                            1 for p in content
+                            if isinstance(p, dict) and p.get("type") == "toolCall"
+                        )
+                elif role == "toolResult":
+                    if _toolresult_msg_is_error(msg):
+                        tool_fails += 1
+    except OSError:
+        return (0, 0)
+    return (tool_calls, tool_fails)
+
+
+def count_tool_failures_query1(query1_path):
+    """遍历 Hermes query1.json 的 turns[].tool_calls[], 返回 (tool_calls, tool_fails)。"""
+    tool_calls = 0
+    tool_fails = 0
+    try:
+        with open(query1_path, encoding="utf-8", errors="replace") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return (0, 0)
+    for t in (data.get("turns") or []):
+        if not isinstance(t, dict):
+            continue
+        for tc in (t.get("tool_calls") or []):
+            if not isinstance(tc, dict):
+                continue
+            tool_calls += 1
+            if _toolcall_output_is_error(tc.get("output")):
+                tool_fails += 1
+    return (tool_calls, tool_fails)
+
+
 def extract_query1_verdict(path):
     """从 query1.json.evaluations[] 取「首轮」裁决。
 

@@ -3,15 +3,17 @@ import io
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
 import tarfile
+import tempfile
 import threading
 import time
 import uuid
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
@@ -101,6 +103,24 @@ _queue_cond = threading.Condition(_job_lock)
 
 _tasks_lock = threading.Lock()
 _stats_write_lock = threading.Lock()  # 串行化 filter_stats.json 的「读-改-写」, 防按需回填互相覆盖
+
+# ── 工具调用失败统计: 后台线程状态(按 task_id) ────────────────────────────────
+# 「统计工具失败」是重操作(需下载全量 assistant 轨迹再分析), 走后台线程, 前端轮询下面状态。
+_toolfail_lock = threading.Lock()
+_toolfail_state = {}  # task_id -> {running, done, total, error, result, finished_at}
+
+# ── 会话全量 workspace 下载: 后台准备 + 就绪后流式打包 ─────────────────────────
+# 下载单个 session 的完整 workspace 可能较大, 先用后台线程 obsutil 拉到临时目录,
+# 前端轮询到 ready 后走流式 tar 下载; 下载(或超时)后临时目录即清。
+_wsdl_lock = threading.Lock()
+_wsdl_state = {}            # f"{task_id}/{session}" -> {running, ready, error, staging, started_at}
+_WS_DL_TTL = 3600           # 就绪后 1 小时未下载则清理临时目录
+
+# ── 会话全量 workspace 缓存: 后台拉取到本地 origin, 长期保留 ────────────────────
+# 「下载全量 workspace」是打包成 tar 给浏览器下载(临时目录即用即删); 「缓存全量
+# workspace」则是把该会话全量文件落进 <output_dir>/origin/<session>/, 供后续分析直接用。
+_wscache_lock = threading.Lock()
+_wscache_state = {}         # f"{task_id}/{session}" -> {running, error, finished_at}
 
 
 def _task_in_queue(task_id: str) -> bool:
@@ -223,6 +243,39 @@ def update_task(task_id: str, **fields):
             t.update(fields)
             break
     save_tasks(tasks)
+
+
+def _sanitize_dir_name(name: str, max_bytes: int = 160) -> Optional[str]:
+    """把任务名改写成可安全用作文件夹名的形式: 去掉文件系统非法字符(/\\:*?\"<>| 与控制字符)、
+    首尾空白与点; 超长按 UTF-8 字节截断; 清洗后为空返回 None(调用方回退到 task_id)。"""
+    s = re.sub(r"[\\/:*?\"<>|\x00-\x1f]", "_", (name or "").strip())
+    s = s.rstrip(". ").strip("_").strip()
+    if not s:
+        return None
+    while len(s.encode("utf-8")) > max_bytes and len(s) > 1:
+        s = s[:-1]
+    return s or None
+
+
+def _task_dir_name(name: str, task_id: str, exclude_dir: Optional[str] = None,
+                   tasks_list: Optional[list] = None) -> str:
+    """为该任务确定 <output_base_dir>/tasks/ 下的文件夹名: 优先任务名(清洗后),
+    与其它任务 / 磁盘上已存在的目录名冲突时加 task_id 后缀。
+    exclude_dir: 该任务自己的旧目录名, 重命名时不再把它视作占用(tasks 与磁盘两边都排除,
+                免得任务已按任务名命名时被自己卡住, 平白加 task_id 后缀)。
+    tasks_list: 可传入外部可变的任务列表(迁移脚本在内存里边改边算, 保证 dry-run == 实跑)。"""
+    base = _sanitize_dir_name(name) or f"task_{task_id}"
+    used = set()
+    for t in (tasks_list if tasks_list is not None else load_tasks()):
+        used.add(Path(t["output_dir"]).name)
+    if exclude_dir:
+        used.discard(exclude_dir)
+    tasks_root = Path(load_config()["output_base_dir"]) / "tasks"
+    if tasks_root.is_dir():
+        used |= {p.name for p in tasks_root.iterdir() if p.is_dir() or p.is_symlink()}
+        if exclude_dir:
+            used.discard(exclude_dir)
+    return base if base not in used else f"{base}_{task_id}"
 
 
 def delete_task_data(output_dir: str):
@@ -753,6 +806,9 @@ def _task_summary(task: dict) -> dict:
             summary["token_stats"] = data["token_stats"]
         if data.get("char_len_stats"):
             summary["char_len_stats"] = data["char_len_stats"]
+        # 工具调用失败统计(需先点「统计工具失败」生成; 未生成时缺省, 前端显示 —)
+        if data.get("tool_fail_stats"):
+            summary["tool_fail_stats"] = data["tool_fail_stats"]
     else:
         summary["available"] = False
         summary["session_total"] = 0
@@ -917,7 +973,9 @@ def api_create_task(body: dict):
 
     cfg = load_config()
     task_id = "t_" + uuid.uuid4().hex[:8]
-    output_dir = str(Path(cfg["output_base_dir"]) / "tasks" / task_id)
+    # 任务文件夹按任务名命名(清洗/去重), 便于人眼直接对应; 命名冲突时追加 task_id 后缀
+    tasks = load_tasks()
+    output_dir = str(Path(cfg["output_base_dir"]) / "tasks" / _task_dir_name(name, task_id))
     task = {
         "id": task_id,
         "name": name,
@@ -934,7 +992,6 @@ def api_create_task(body: dict):
         "last_exit_code": None,
         "last_error": None,
     }
-    tasks = load_tasks()
     tasks.append(task)
     save_tasks(tasks)
 
@@ -988,7 +1045,21 @@ def api_rename_task(task_id: str, body: dict):
     name = (body.get("name") or "").strip()
     if not name:
         return JSONResponse({"success": False, "message": "任务名称不能为空"}, status_code=400)
-    update_task(task_id, name=name)
+    # 采集中禁止重命名: 目录移动会打断正在写入的子进程
+    with _job_lock:
+        if _job_state["running"] and _job_state["task_id"] == task_id:
+            return JSONResponse({"success": False, "message": "该任务正在采集中，暂不能重命名"}, status_code=409)
+
+    old_od = Path(task["output_dir"])
+    new_name = _task_dir_name(name, task_id, exclude_dir=old_od.name)
+    new_od = old_od.parent / new_name
+    # 目录确实存在且确实要改名: 原地 mv(同一文件系统, 便宜), 数据不复制
+    if str(new_od) != str(old_od):
+        if new_od.exists():
+            return JSONResponse({"success": False, "message": f"目标文件夹已存在: {new_name}"}, status_code=409)
+        if old_od.exists():
+            old_od.rename(new_od)
+    update_task(task_id, name=name, output_dir=str(new_od))
     return {"success": True, "task": find_task(task_id)}
 
 
@@ -1190,10 +1261,12 @@ def _load_simplified_trajectory(session: str, output_dir: str) -> Optional[dict]
 
 # ── workspace 来源的轨迹查看(assistant .jsonl + log 裁决 + 按需拉 evaluator) ──────
 
-def _simplify_workspace_message(role: str, parts: list) -> Optional[dict]:
+def _simplify_workspace_message(role: str, parts: list, msg: Optional[dict] = None) -> Optional[dict]:
     """把 workspace assistant/evaluator .jsonl 的一条 message 的 content 部件列表,
     映射成前端已认的结构 {role, content, reasoning_content, tool_calls, truncated}。
-    部件类型: thinking / text / toolCall / (toolResult 侧的) text。"""
+    部件类型: thinking / text / toolCall / (toolResult 侧的) text。
+    msg: 完整 message 对象, 用于捞出 content 之外的 message 层元数据
+         (toolResult 的 toolName / isError / details.exitCode 等)。"""
     texts, reasonings, tool_calls = [], [], []
     for p in parts:
         if not isinstance(p, dict):
@@ -1226,6 +1299,23 @@ def _simplify_workspace_message(role: str, parts: list) -> Optional[dict]:
         out["reasoning_content"] = reasoning
     if tool_calls:
         out["tool_calls"] = tool_calls
+
+    # toolResult 侧的 message 层元数据: 工具名 / 是否报错 / 退出码 / 结构化 details
+    if isinstance(msg, dict) and role == "toolResult":
+        if msg.get("toolName"):
+            out["tool_name"] = msg["toolName"]
+        if msg.get("isError"):
+            out["is_error"] = True
+        details = msg.get("details")
+        if isinstance(details, dict):
+            # exec 类工具的退出码; 非 0 视作失败信号
+            if details.get("exitCode") is not None:
+                out["exit_code"] = details["exitCode"]
+            det_str = json.dumps(details, ensure_ascii=False, indent=2)
+            if len(det_str) > _MAX_MSG_CHARS:
+                det_str = det_str[:_MAX_MSG_CHARS]
+                out["details_truncated"] = True
+            out["details"] = det_str
     return out
 
 
@@ -1276,7 +1366,7 @@ def _load_workspace_jsonl_trajectory(jsonl_path: Path, session: str) -> Optional
                     truncated = True
                 messages.append({"role": role, "content": text, "truncated": truncated})
             elif isinstance(content, list):
-                simplified = _simplify_workspace_message(role, content)
+                simplified = _simplify_workspace_message(role, content, msg)
                 if simplified:
                     messages.append(simplified)
 
@@ -2047,6 +2137,67 @@ def _iter_tar_stream(root_dir: Path, arcname: str, chunk_size: int = 1024 * 1024
         yield b"".join(buf.chunks)
 
 
+def _run_tool_failure_analysis(task: dict):
+    """后台线程: 下载全量 assistant 轨迹 + 统计 tool_call 失败, 写回 filter_stats.json。
+    进度/结果写入 _toolfail_state[task_id] 供前端轮询。"""
+    import analyze_tool_failures  # 延迟导入, 避免与 server 循环导入
+    tid = task["id"]
+
+    def progress(done, total):
+        with _toolfail_lock:
+            st = _toolfail_state.get(tid)
+            if st is not None:
+                st["done"] = done
+                st["total"] = total
+
+    try:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with _stats_write_lock:  # 与 char_len/token 回填串行, 防 filter_stats.json 互相覆盖
+            result = analyze_tool_failures.analyze(task, progress=progress, now_iso=now_iso)
+        with _toolfail_lock:
+            _toolfail_state[tid] = {
+                "running": False, "done": result.get("analyzed_sessions", 0),
+                "total": result.get("analyzed_sessions", 0), "error": None,
+                "result": result, "finished_at": now_iso,
+            }
+    except Exception as e:  # noqa: BLE001  失败也要落到状态里让前端看到
+        with _toolfail_lock:
+            st = _toolfail_state.get(tid, {})
+            st.update({"running": False, "error": str(e), "result": None})
+            _toolfail_state[tid] = st
+
+
+@app.post("/api/tasks/{task_id}/analyze-tool-failures")
+def api_analyze_tool_failures(task_id: str):
+    """触发「统计工具失败」: 起后台线程下载全量 assistant 轨迹并统计失败次数。"""
+    task = find_task(task_id)
+    if not task:
+        return JSONResponse({"success": False, "message": "任务不存在"}, status_code=404)
+    if task.get("source_type") != "workspace":
+        return JSONResponse(
+            {"success": False, "message": "仅 workspace 来源的任务支持工具失败统计"},
+            status_code=400,
+        )
+    with _toolfail_lock:
+        st = _toolfail_state.get(task_id)
+        if st and st.get("running"):
+            return {"success": False, "message": "该任务正在统计工具失败，请稍候"}
+        _toolfail_state[task_id] = {
+            "running": True, "done": 0, "total": 0,
+            "error": None, "result": None, "finished_at": None,
+        }
+    threading.Thread(target=_run_tool_failure_analysis, args=(task,), daemon=True).start()
+    return {"success": True, "message": "已开始统计工具失败（后台下载轨迹并分析，请稍候）"}
+
+
+@app.get("/api/tasks/{task_id}/tool-failure-status")
+def api_tool_failure_status(task_id: str):
+    """前端轮询「统计工具失败」进度/结果。无记录表示从未触发过。"""
+    with _toolfail_lock:
+        st = _toolfail_state.get(task_id)
+        return {"found": st is not None, "status": dict(st) if st else None}
+
+
 @app.get("/api/tasks/{task_id}/download-origin")
 def api_download_origin(task_id: str):
     """把该任务本地已下载的原始轨迹目录(<output_dir>/origin/)流式打包成 tar 供下载。
@@ -2080,6 +2231,174 @@ def api_download_origin(task_id: str):
         media_type="application/x-tar",
         headers=headers,
     )
+
+
+def _prepare_session_workspace(task: dict, session: str, key: str):
+    """后台线程: 把 <workspace_obs>/<session>/ 全量拉到临时目录, 结果写入 _wsdl_state[key]。
+    下载成功且 session 目录存在才标记 ready(临时目录即作 tar 源)。"""
+    workspace_obs = (task.get("workspace_obs") or "").rstrip("/")
+    task_obs = f"{workspace_obs}/{session}/"
+    cfg = load_config()
+    # obsutil cp <prefix>/ <dest> -r 会落成 <dest>/<session>/... (prefix 末段多一层), 正好作 tar 顶层
+    staging = Path(tempfile.mkdtemp(prefix=f"session_ws_{session[:24].replace('/', '_')}_"))
+
+    def _done(**fields):
+        with _wsdl_lock:
+            _wsdl_state[key] = {"running": False, "ready": False, "error": None, "staging": None,
+                                "started_at": time.time(), **fields}
+
+    try:
+        cmd = [cfg["obsutil_path"], "cp", task_obs, str(staging), "-r", "-f"]
+        cmd += _obs_cred_args_for_task(task)
+        res = subprocess.run(cmd, capture_output=True, text=True,
+                             encoding="utf-8", errors="replace", timeout=1800)
+    except subprocess.TimeoutExpired:
+        shutil.rmtree(staging, ignore_errors=True)
+        _done(error="OBS 下载超时(可能 workspace 过大)")
+        return
+    if res.returncode != 0:
+        shutil.rmtree(staging, ignore_errors=True)
+        _done(error=f"OBS 下载失败: {(res.stderr or '')[-300:]}")
+        return
+    if not (staging / session).is_dir():
+        shutil.rmtree(staging, ignore_errors=True)
+        _done(error="OBS 上未找到该 session 的 workspace")
+        return
+    with _wsdl_lock:
+        _wsdl_state[key] = {"running": False, "ready": True, "error": None,
+                            "staging": str(staging), "started_at": time.time()}
+
+
+@app.post("/api/tasks/{task_id}/session-workspace/{session}/prepare")
+def api_session_workspace_prepare(task_id: str, session: str):
+    """触发准备: 后台下载该 session 的全量 workspace 到临时目录, 供随后流式下载。"""
+    task = find_task(task_id)
+    if not task:
+        return JSONResponse({"success": False, "message": "任务不存在"}, status_code=404)
+    if task.get("source_type") != "workspace":
+        return JSONResponse({"success": False, "message": "仅 workspace 来源的任务支持下载全量 workspace"},
+                            status_code=400)
+    if not session or "/" in session or ".." in session:
+        return JSONResponse({"success": False, "message": "非法 session"}, status_code=400)
+    if not (task.get("workspace_obs") or "").rstrip("/"):
+        return JSONResponse({"success": False, "message": "该任务无 workspace_obs"}, status_code=400)
+
+    key = f"{task_id}/{session}"
+    with _wsdl_lock:
+        st = _wsdl_state.get(key)
+        if st and st.get("running"):
+            return {"success": True, "running": True, "ready": False, "message": "该会话 workspace 正在准备中"}
+        if st and st.get("ready"):
+            return {"success": True, "running": False, "ready": True, "message": "该会话 workspace 已就绪"}
+        _wsdl_state[key] = {"running": True, "ready": False, "error": None,
+                            "staging": None, "started_at": time.time()}
+    threading.Thread(target=_prepare_session_workspace, args=(task, session, key), daemon=True).start()
+    return {"success": True, "running": True, "ready": False, "message": "已开始准备该会话的全量 workspace"}
+
+
+@app.get("/api/tasks/{task_id}/session-workspace/{session}/status")
+def api_session_workspace_status(task_id: str, session: str):
+    """前端轮询: {found, running, ready, error}。就绪后超过 TTL 未下载则清掉临时目录。"""
+    key = f"{task_id}/{session}"
+    with _wsdl_lock:
+        st = _wsdl_state.get(key)
+        if not st:
+            return {"found": False}
+        if st.get("ready") and time.time() - st.get("started_at", 0) > _WS_DL_TTL:
+            if st.get("staging"):
+                shutil.rmtree(st.get("staging"), ignore_errors=True)
+            _wsdl_state.pop(key, None)
+            return {"found": False}
+        return {"found": True, "running": st.get("running"), "ready": st.get("ready"),
+                "error": st.get("error")}
+
+
+@app.get("/api/tasks/{task_id}/session-workspace/{session}/download")
+def api_session_workspace_download(task_id: str, session: str):
+    """就绪后流式打包下载(取走即清临时目录, 不重复)。"""
+    key = f"{task_id}/{session}"
+    with _wsdl_lock:
+        st = _wsdl_state.get(key)
+        if not st or not st.get("ready") or not st.get("staging"):
+            return JSONResponse({"success": False, "message": "workspace 尚未准备好, 请先触发准备"}, status_code=409)
+        staging = Path(st["staging"])
+        _wsdl_state.pop(key, None)
+
+    ascii_name = re.sub(r"[^\w.\-]", "_", session, flags=re.ASCII).strip("_") or "session"
+    utf8_name = re.sub(r"[\\/:*?\"<>|]", "_", session) or "session"
+    headers = {
+        "Content-Disposition": (
+            f'attachment; filename="{ascii_name}_workspace.tar"; '
+            f"filename*=UTF-8''{quote(utf8_name + '_workspace.tar')}"
+        )
+    }
+
+    def _stream():
+        try:
+            yield from _iter_tar_stream(staging, arcname=ascii_name)
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
+    return StreamingResponse(_stream(), media_type="application/x-tar", headers=headers)
+
+
+def _cache_session_workspace(task: dict, session: str, key: str):
+    """后台线程: 把 <workspace_obs>/<session>/ 全量拉取到 <output_dir>/origin/<session>/。
+    obsutil cp <prefix>/ <origin> -r 会按 prefix 末段建一层, <session>/ 正好落成 origin/<session>/,
+    与既有本地目录结构一致; -f 增量覆盖刷新, 不删除本地已有的其它文件。"""
+    workspace_obs = (task.get("workspace_obs") or "").rstrip("/")
+    task_obs = f"{workspace_obs}/{session}/"
+    cfg = load_config()
+    origin = origin_dir(task["output_dir"])
+    origin.mkdir(parents=True, exist_ok=True)
+    cmd = [cfg["obsutil_path"], "cp", task_obs, str(origin), "-r", "-f"]
+    cmd += _obs_cred_args_for_task(task)
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True,
+                             encoding="utf-8", errors="replace", timeout=3600)
+    except subprocess.TimeoutExpired:
+        err = "OBS 下载超时(可能 workspace 过大)"
+    else:
+        err = None if res.returncode == 0 else f"OBS 下载失败: {(res.stderr or '')[-300:]}"
+    if err is None and not (origin / session).is_dir():
+        err = "OBS 上未找到该 session 的 workspace"
+    with _wscache_lock:
+        _wscache_state[key] = {"running": False, "error": err, "finished_at": time.time()}
+
+
+@app.post("/api/tasks/{task_id}/session-workspace/{session}/cache")
+def api_session_workspace_cache(task_id: str, session: str):
+    """触发「缓存全量 workspace」: 后台把该会话全量文件拉取到本地 origin, 长期保留。"""
+    task = find_task(task_id)
+    if not task:
+        return JSONResponse({"success": False, "message": "任务不存在"}, status_code=404)
+    if task.get("source_type") != "workspace":
+        return JSONResponse({"success": False, "message": "仅 workspace 来源的任务支持缓存全量 workspace"},
+                            status_code=400)
+    if not session or "/" in session or ".." in session:
+        return JSONResponse({"success": False, "message": "非法 session"}, status_code=400)
+    if not (task.get("workspace_obs") or "").rstrip("/"):
+        return JSONResponse({"success": False, "message": "该任务无 workspace_obs"}, status_code=400)
+
+    key = f"{task_id}/{session}"
+    with _wscache_lock:
+        st = _wscache_state.get(key)
+        if st and st.get("running"):
+            return {"success": True, "running": True, "message": "该会话正在缓存全量 workspace"}
+        _wscache_state[key] = {"running": True, "error": None, "finished_at": None}
+    threading.Thread(target=_cache_session_workspace, args=(task, session, key), daemon=True).start()
+    return {"success": True, "running": True, "message": "已开始缓存该会话的全量 workspace 到本地"}
+
+
+@app.get("/api/tasks/{task_id}/session-workspace/{session}/cache-status")
+def api_session_workspace_cache_status(task_id: str, session: str):
+    """前端轮询缓存进度: {found, running, error}。"""
+    key = f"{task_id}/{session}"
+    with _wscache_lock:
+        st = _wscache_state.get(key)
+        if not st:
+            return {"found": False}
+        return {"found": True, "running": st.get("running"), "error": st.get("error")}
 
 
 @app.get("/api/job-status")

@@ -127,6 +127,25 @@ body{
   background:rgba(0,255,168,.06);border:1px solid rgba(0,255,168,.2);border-radius:4px;padding:4px 8px;
   word-break:break-all;
 }
+.role-toolResult .traj-msg-role{color:var(--neon-green)}
+.traj-tr-head{display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap}
+.traj-tr-tool{font-family:ui-monospace,monospace;font-size:11px;color:var(--neon-green);font-weight:600}
+.traj-badge-err{
+  font-family:ui-monospace,monospace;font-size:10px;font-weight:700;color:#ff3d6e;
+  background:rgba(255,61,110,.1);border:1px solid rgba(255,61,110,.4);border-radius:4px;padding:1px 6px;
+}
+.traj-badge-ok{
+  font-family:ui-monospace,monospace;font-size:10px;color:var(--text-2);
+  border:1px solid var(--border);border-radius:4px;padding:1px 6px;
+}
+.traj-details{margin-top:6px}
+.traj-details-toggle{color:var(--text-2);font-size:11px;cursor:pointer;font-family:ui-monospace,monospace;user-select:none}
+.traj-details-toggle:hover{color:var(--neon-cyan)}
+.traj-details-body{
+  margin:4px 0 0;font-family:ui-monospace,monospace;font-size:11px;color:var(--text-1);
+  background:var(--bg-0);border:1px solid var(--border);border-radius:4px;padding:6px 8px;
+  white-space:pre-wrap;word-break:break-word;max-height:320px;overflow:auto;
+}
 .traj-tabs{display:flex;gap:6px;margin-top:12px;border-bottom:1px solid var(--border)}
 .traj-tab{
   padding:6px 12px;font-size:12px;color:var(--text-1);cursor:pointer;border-bottom:2px solid transparent;
@@ -306,6 +325,18 @@ body{
             <span v-else style="color:var(--text-2)">—</span>
           </template>
         </el-table-column>
+        <el-table-column label="工具失败" width="130" align="center">
+          <template #default="{row}">
+            <template v-if="row.tool_fail_stats">
+              <span style="font-family:ui-monospace,monospace;font-size:12px;color:var(--neon-red,#ff5c7c)"
+                :title="'口径=显式错误标记(openclaw: isError/exitCode; Hermes: ok=false/error/success=false/exit_code)。总调用 '+row.tool_fail_stats.total_tool_calls+' 次, 已分析 '+row.tool_fail_stats.analyzed_sessions+' 个 session'">
+                {{ (row.tool_fail_stats.total_tool_fails||0).toLocaleString() }}
+                <span style="color:var(--text-2);font-size:11px">/ {{ ((row.tool_fail_stats.fail_rate||0)*100).toFixed(1) }}%</span>
+              </span>
+            </template>
+            <span v-else style="color:var(--text-2)" title="尚未统计, 点操作列「统计工具失败」生成">—</span>
+          </template>
+        </el-table-column>
         <el-table-column label="状态" width="100" align="center">
           <template #default="{row}">
             <el-tag v-if="jobStatus.running && jobStatus.task_id === row.id" type="warning" size="small">采集中</el-tag>
@@ -315,11 +346,15 @@ body{
             <el-tag v-else type="info" size="small">未运行</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="340" align="center">
+        <el-table-column label="操作" width="440" align="center">
           <template #default="{row}">
             <el-button v-if="queuePosition(row.id) > 0" size="small" text type="danger" @click="cancelQueue(row)">取消排队</el-button>
             <el-button v-else size="small" text :disabled="jobStatus.running && jobStatus.task_id === row.id" @click="retriggerTask(row)">重新采集</el-button>
             <el-button size="small" text :disabled="!row.available" @click="downloadOrigin(row)">下载原始轨迹</el-button>
+            <el-button size="small" text :disabled="!row.available || (toolFailState[row.id] && toolFailState[row.id].running)"
+              :loading="toolFailState[row.id] && toolFailState[row.id].running" @click="analyzeToolFailures(row)">
+              {{ toolFailState[row.id] && toolFailState[row.id].running ? '统计中…' : '统计工具失败' }}
+            </el-button>
             <el-button size="small" text @click="openRenameForm(row)">重命名</el-button>
             <el-button size="small" text @click="openGroupsForm(row)">编辑分组</el-button>
             <el-popconfirm title="确定删除该任务及其采集到的所有数据吗？此操作不可恢复。" confirm-button-text="删除" cancel-button-text="取消" @confirm="deleteTask(row)">
@@ -420,6 +455,17 @@ body{
         <el-table-column label="TASK_DONE" width="90" align="center">
           <template #default="{row}">
             <el-tag v-if="row.task_done !== undefined" :type="row.task_done ? 'success' : 'info'" size="small">{{ row.task_done ? '是' : '否' }}</el-tag>
+            <span v-else style="color:var(--text-2)">—</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="工具失败" width="110" align="center">
+          <template #default="{row}">
+            <template v-if="row.tool_fail_count !== undefined && row.tool_fail_count !== null">
+              <span style="font-family:ui-monospace,monospace;font-size:12px;color:var(--neon-red,#ff5c7c)"
+                :title="'失败 '+row.tool_fail_count+' / 调用 '+(row.tool_calls||0)">
+                {{ row.tool_fail_count }}<span style="color:var(--text-2);font-size:11px"> / {{ row.tool_calls || 0 }}</span>
+              </span>
+            </template>
             <span v-else style="color:var(--text-2)">—</span>
           </template>
         </el-table-column>
@@ -561,6 +607,16 @@ body{
     <el-descriptions :column="1" border size="small">
       <el-descriptions-item label="Session ID">
         <span style="font-family:ui-monospace,monospace;font-size:12px;color:var(--neon-cyan);word-break:break-all">{{ selectedSession.session }}</span>
+        <el-button v-if="isWorkspaceTask" size="small" text type="primary" style="margin-left:12px"
+          :disabled="wsDownloading" :loading="wsDownloading" @click="downloadSessionWorkspace">
+          {{ wsDownloading ? '打包中…' : '下载全量 workspace' }}
+        </el-button>
+        <el-button v-if="isWorkspaceTask" size="small" text type="success" style="margin-left:6px"
+          :disabled="wsCaching" :loading="wsCaching" @click="cacheSessionWorkspace"
+          title="从 OBS 把该会话全量 workspace 拉到本地 origin, 长期保留(不经浏览器下载)">
+          {{ wsCaching ? '缓存中…' : '缓存全量 workspace' }}
+        </el-button>
+        <span v-else style="margin-left:12px;font-size:11px;color:var(--text-2)">(仅 workspace 来源可下载/缓存全量)</span>
       </el-descriptions-item>
       <el-descriptions-item label="有评测结果">
         <el-tag :type="selectedSession.has_eval?'success':'info'">{{ selectedSession.has_eval?'是':'否' }}</el-tag>
@@ -695,6 +751,13 @@ body{
           <div class="traj-msg-body">
             <div v-if="isMsgCollapsed(i)" class="traj-collapsed-hint" @click="toggleMsg(i)">（已折叠，点击展开）</div>
             <template v-else>
+              <div v-if="m.role === 'toolResult' && (m.tool_name || m.is_error || m.exit_code !== undefined)" class="traj-tr-head">
+                <span v-if="m.tool_name" class="traj-tr-tool">⚙ {{ m.tool_name }}</span>
+                <span v-if="m.is_error || (m.exit_code !== undefined && m.exit_code !== 0)" class="traj-badge-err">
+                  ✗ 失败<template v-if="m.exit_code !== undefined && m.exit_code !== 0"> · exit {{ m.exit_code }}</template>
+                </span>
+                <span v-else-if="m.exit_code === 0" class="traj-badge-ok">exit 0</span>
+              </div>
               <div v-if="m.reasoning_content" class="traj-reasoning">
                 <span>{{ displayText(m.reasoning_content, i, 'r') }}</span>
                 <span v-if="isLong(m.reasoning_content)" class="traj-more" @click="toggleText(i, 'r')">
@@ -711,6 +774,12 @@ body{
                 <div v-for="(tc, j) in m.tool_calls" :key="j" class="traj-toolcall">
                   🔧 {{ tc.name }}<span v-if="tc.arguments">({{ tc.arguments }})</span>
                 </div>
+              </div>
+              <div v-if="m.details" class="traj-details">
+                <span class="traj-details-toggle" @click="toggleText(i, 'd')">
+                  {{ isTextExpanded(i, 'd') ? '▼ 结构化 details' : '▶ 结构化 details' }}
+                </span>
+                <pre v-if="isTextExpanded(i, 'd')" class="traj-details-body">{{ m.details }}<span v-if="m.details_truncated" class="traj-cut"> …(已截断)</span></pre>
               </div>
             </template>
           </div>
@@ -776,8 +845,11 @@ createApp({
       levelFilter: [],     // L0/L1/L1.5/L2/L3 层级筛选(多选)
       loading: false,
       jobStatus: {running: false, queue: [], queue_len: 0},
+      toolFailState: {},   // 工具失败统计: {taskId: {running, done, total}}, 后台线程进度轮询
       selectedSession: null,
       detailVisible: false,
+      wsDownloading: false,  // 会话全量 workspace 打包下载中
+      wsCaching: false,      // 会话全量 workspace 缓存到本地中
       trajLoading: false,
       trajLoaded: false,
       trajError: '',
@@ -1218,6 +1290,117 @@ createApp({
       document.body.removeChild(a)
       ElementPlus.ElMessage.success('已开始下载原始轨迹（数据较大，请耐心等待浏览器完成下载）')
     },
+    async analyzeToolFailures(task) {
+      // 触发后台「下载全量 assistant 轨迹 + 统计 tool_call 失败」, 随后轮询进度。
+      if (!task.available) {
+        ElementPlus.ElMessage.warning('该任务暂无可分析的轨迹数据')
+        return
+      }
+      try {
+        const r = await axios.post(`/api/tasks/${task.id}/analyze-tool-failures`)
+        if (!r.data.success) {
+          ElementPlus.ElMessage.warning(r.data.message || '无法启动统计')
+          return
+        }
+        this.toolFailState[task.id] = { running: true, done: 0, total: 0 }
+        ElementPlus.ElMessage.success('已开始统计工具失败（需先下载全量轨迹，请稍候）')
+        this.pollToolFailure(task.id)
+      } catch (e) {
+        ElementPlus.ElMessage.error('启动统计失败: ' + (e.response?.data?.detail || e.message))
+      }
+    },
+    pollToolFailure(taskId) {
+      // 轮询后台状态到结束, 完成后静默刷新任务列表(带出新的 tool_fail_stats)。
+      // 后端返回 {found, status:{running, done, total, error, result:{total_tool_fails, fail_rate,...}, finished_at}}
+      const tick = async () => {
+        try {
+          const r = await axios.get(`/api/tasks/${taskId}/tool-failure-status`)
+          const st = (r.data && r.data.status) || {}
+          this.toolFailState[taskId] = {
+            running: !!st.running, done: st.done || 0, total: st.total || 0,
+          }
+          if (st.running) {
+            setTimeout(tick, 2000)
+            return
+          }
+          // 结束: 成功/失败
+          if (st.error) {
+            ElementPlus.ElMessage.error('统计失败: ' + st.error)
+          } else if (st.result) {
+            ElementPlus.ElMessage.success(
+              `工具失败统计完成: 失败 ${st.result.total_tool_fails ?? '?'} 次, 失败率 ${((st.result.fail_rate || 0) * 100).toFixed(1)}%`)
+          }
+          await this.loadTasks(true)
+        } catch (e) {
+          this.toolFailState[taskId] = { running: false }
+          console.error('pollToolFailure', e)
+        }
+      }
+      setTimeout(tick, 1500)
+    },
+    async downloadSessionWorkspace() {
+      // 全量 workspace 可能较大: 先 POST prepare 让后端后台拉取, 轮询到 ready 再触发浏览器原生下载。
+      if (!this.selectedSession) return
+      const s = this.selectedSession.session
+      const base = `/api/tasks/${this.activeTaskId}/session-workspace/${encodeURIComponent(s)}`
+      this.wsDownloading = true
+      try {
+        const r = await axios.post(base + '/prepare')
+        if (r.data.error) throw new Error(r.data.error)
+        if (r.data.ready) { this.triggerWorkspaceDownload(base + '/download'); return }
+        // 轮询到就绪/失败, 上限 15 分钟(超大 workspace 下载较慢)
+        const deadline = Date.now() + 15 * 60 * 1000
+        while (Date.now() < deadline) {
+          const st = await axios.get(base + '/status')
+          const d = st.data
+          if (d.found && d.error) throw new Error(d.error)
+          if (d.found && d.ready) { this.triggerWorkspaceDownload(base + '/download'); return }
+          if (!d.found) throw new Error('准备状态已失效, 请重试')
+          await new Promise(res => setTimeout(res, 1500))
+        }
+        throw new Error('准备超时(15 分钟), 请重试')
+      } catch (e) {
+        ElementPlus.ElMessage.error('下载失败: ' + (e.response?.data?.message || e.response?.data?.detail || e.message || '请稍后重试'))
+      } finally {
+        this.wsDownloading = false
+      }
+    },
+    triggerWorkspaceDownload(url) {
+      const a = document.createElement('a')
+      a.href = url
+      a.download = ''
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      ElementPlus.ElMessage.success('已开始下载该会话的全量 workspace')
+    },
+    async cacheSessionWorkspace() {
+      // 把该会话全量 workspace 从 OBS 拉到本地 origin 长期保留(不经浏览器下载), 后台执行并轮询。
+      if (!this.selectedSession) return
+      const s = this.selectedSession.session
+      const base = `/api/tasks/${this.activeTaskId}/session-workspace/${encodeURIComponent(s)}`
+      this.wsCaching = true
+      try {
+        const r = await axios.post(base + '/cache')
+        if (r.data.error) throw new Error(r.data.error)
+        // 轮询到完成/失败, 上限 65 分钟(超大 workspace 下载较慢, 与后端 3600s 超时对齐)
+        const deadline = Date.now() + 65 * 60 * 1000
+        let done = false
+        while (Date.now() < deadline) {
+          const st = await axios.get(base + '/cache-status')
+          const d = st.data
+          if (d.found && d.error) throw new Error(d.error)
+          if (d.found && !d.running) { done = true; break }
+          await new Promise(res => setTimeout(res, 2000))
+        }
+        if (!done) throw new Error('缓存超时, 请重试')
+        ElementPlus.ElMessage.success('已缓存该会话的全量 workspace 到本地')
+      } catch (e) {
+        ElementPlus.ElMessage.error('缓存失败: ' + (e.response?.data?.message || e.response?.data?.detail || e.message || '请稍后重试'))
+      } finally {
+        this.wsCaching = false
+      }
+    },
     onGroupChange() {
       // 用户主动切换分组时回到第一页(与轮询中的静默筛选区分开)
       this.taskPage = 1
@@ -1424,7 +1607,7 @@ createApp({
       return text.slice(0, 600)
     },
     roleLabel(role) {
-      return { system: 'SYSTEM', user: 'USER', assistant: 'ASSISTANT', tool: 'TOOL' }[role] || (role || '').toUpperCase()
+      return { system: 'SYSTEM', user: 'USER', assistant: 'ASSISTANT', tool: 'TOOL', toolResult: 'RESULT' }[role] || (role || '').toUpperCase()
     },
     completionColor(v) {
       if (v === null || v === undefined) return '#5b6a8f'

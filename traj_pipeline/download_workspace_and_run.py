@@ -85,18 +85,25 @@ EXCLUDE_PATTERNS = ["*.trajectory.jsonl", "*_use.log", "*profiles/*/logs/*", "*_
 # Hermes 专用模式（assistant 侧: assistant* 或 main，对应 _is_assistant_agent_dir()）。
 # 与通用模式的区别:
 #   - 去掉 openclaw 的 .jsonl 格式(*assistant*sessions*.jsonl 等)
-#   - 去掉 *logs*.log（Hermes 从不读 log 文件取分，取分走 query1.json）
 #   - 保留 profiles/assistant* 和 profiles/main 的 sessions
 #   - 保留 profiles/assistant*/state.db*（token 用量）
 #   - evaluator sessions 不走 bulk，由详情页按需懒加载(_ensure_hermes_evaluator)
+# 主 log(logs/<task>.log): Hermes 也有, 分数走 query1.json, 但「【Task_Done】」标记只在主 log
+#   正文里(check_task_done_in_logs_dir 扫 <task>.log), 故必须下载, 否则 task_done_count 恒为 0。
+#   顺带让详情页「任务 Log」标签秒开(本地已有, 不必按需拉取)。
 HERMES_INCLUDE = [
     "*logs/trajectories/*query*.json",            # 分数 + 裁决 + 聚合轨迹
+    "*logs*.log",                                  # 主 log(<task>.log): TASK_DONE 标记 + 详情页任务 Log
     "*profiles/assistant*/sessions/*.json",        # assistant sessions
     "*profiles/main/sessions/*.json",              # main sessions（备选 agent 名）
     "*profiles/assistant*/state.db*",              # token 用量 DB
 ]
-# Hermes 没有 *.trajectory.jsonl，保留 exclude 仅作安全冗余
-HERMES_EXCLUDE = ["*.trajectory.jsonl"]
+# 宽泛的 *logs*.log include 会连带匹配噪音日志, 逐条 exclude 挡掉(统计/详情都不读, 与通用模式一致):
+#   - *_use.log           : api_use.log / evaluator_use.log
+#   - *profiles/*/logs/*  : profiles 内 agent.log/errors.log
+#   - *_logs/*.log        : npm 调试日志
+# Hermes 没有 *.trajectory.jsonl，保留该 exclude 仅作安全冗余
+HERMES_EXCLUDE = ["*.trajectory.jsonl", "*_use.log", "*profiles/*/logs/*", "*_logs/*.log"]
 
 
 def obs_leaf(obs_path):
