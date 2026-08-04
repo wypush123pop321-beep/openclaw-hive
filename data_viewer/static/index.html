@@ -119,6 +119,18 @@ body{
 .role-tool .traj-msg-role{color:var(--neon-green)}
 .traj-msg-body{flex:1;min-width:0;font-size:13px;line-height:1.7}
 .traj-reasoning{color:var(--text-2);font-style:italic;white-space:pre-wrap;word-break:break-word;margin-bottom:6px}
+.traj-sig-block{margin-top:6px;display:flex;flex-direction:column;gap:4px}
+.traj-sig-head{font-family:ui-monospace,monospace;font-size:11px;font-weight:700;color:var(--neon-amber);letter-spacing:.3px}
+.traj-sig-chip{
+  display:flex;align-items:center;gap:8px;cursor:pointer;user-select:none;
+  font-family:ui-monospace,monospace;font-size:11px;color:var(--neon-amber);
+  background:rgba(255,194,60,.07);border:1px solid rgba(255,194,60,.35);border-radius:4px;padding:3px 8px;
+  word-break:break-all;
+}
+.traj-sig-chip:hover{background:rgba(255,194,60,.14);border-color:rgba(255,194,60,.7)}
+.traj-sig-text{flex:1;min-width:0}
+.traj-sig-copy{flex-shrink:0;font-size:10px;color:var(--text-1);border:1px solid var(--border);border-radius:3px;padding:0 4px}
+.traj-sig-copy.copied{color:var(--neon-green);border-color:rgba(0,255,168,.4)}
 .traj-content{color:var(--text-0);white-space:pre-wrap;word-break:break-word}
 .traj-cut{color:var(--neon-amber);font-size:11px}
 .traj-toolcalls{margin-top:6px;display:flex;flex-direction:column;gap:4px}
@@ -764,6 +776,13 @@ body{
                   {{ isTextExpanded(i, 'r') ? ' 收起 ▲' : ' …展开看全文 ▼' }}
                 </span>
               </div>
+              <div v-if="m.thinking_signatures && m.thinking_signatures.length" class="traj-sig-block">
+                <div class="traj-sig-head">🧠 thinkingSignature ×{{ m.thinking_signatures.length }}</div>
+                <div v-for="(s, si) in m.thinking_signatures" :key="si" class="traj-sig-chip" :title="s" @click="copySig(i, si)">
+                  <span class="traj-sig-text">{{ displaySig(s) }}</span>
+                  <span class="traj-sig-copy" :class="{copied: isSigCopied(i, si)}">{{ isSigCopied(i, si) ? '✓ 已复制' : '📋 复制' }}</span>
+                </div>
+              </div>
               <div v-if="m.content" class="traj-content">
                 <span>{{ displayText(m.content, i, 'c') }}</span>
                 <span v-if="isLong(m.content)" class="traj-more" @click="toggleText(i, 'c')">
@@ -862,6 +881,8 @@ createApp({
       logData: null,      // {filename, size, truncated, log}
       msgCollapsed: {},   // 详情: 每块是否折叠, key = `${tab}:${i}`
       textExpanded: {},   // 详情: 长文本是否展开看全文, key = `${tab}:${i}:${kind}`
+      sigCopied: {},      // 详情: thinkingSignature 复制反馈, key = `${tab}:${i}:sig${si}`
+      _sigCopiedTimer: null,
       _pollTimer: null,
       _tickTimer: null,
       nowTick: Date.now(),
@@ -1504,6 +1525,7 @@ createApp({
       this.logData = null
       this.msgCollapsed = {}
       this.textExpanded = {}
+      this.sigCopied = {}
       // workspace 任务: 点开即自动加载 log(文件已本地缓存), 无需点「查看具体轨迹」
       if (this.isWorkspaceTask) this.loadTaskLog()
     },
@@ -1605,6 +1627,38 @@ createApp({
     displayText(text, i, kind) {
       if (!this.isLong(text) || this.isTextExpanded(i, kind)) return text
       return text.slice(0, 600)
+    },
+    _sigKey(i, si) { return this.trajTab + ':' + i + ':sig' + si },
+    displaySig(s) {
+      return typeof s === 'string' && s.length > 48 ? s.slice(0, 48) + '…' : (s || '')
+    },
+    isSigCopied(i, si) { return !!this.sigCopied[this._sigKey(i, si)] },
+    copySig(i, si) {
+      const msgs = (this.activeTrajData && this.activeTrajData.messages) || []
+      const msg = msgs[i]
+      if (!msg || !msg.thinking_signatures) return
+      const s = msg.thinking_signatures[si]
+      if (typeof s !== 'string' || !s) return
+      const k = this._sigKey(i, si)
+      const done = () => {
+        this.sigCopied = { ...this.sigCopied, [k]: true }
+        clearTimeout(this._sigCopiedTimer)
+        this._sigCopiedTimer = setTimeout(() => {
+          this.sigCopied = { ...this.sigCopied, [k]: false }
+        }, 1500)
+      }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(s).then(done).catch(() => {})
+      } else {
+        const ta = document.createElement('textarea')
+        ta.value = s
+        ta.style.position = 'fixed'
+        ta.style.opacity = '0'
+        document.body.appendChild(ta)
+        ta.select()
+        try { document.execCommand('copy'); done() } catch (e) {}
+        document.body.removeChild(ta)
+      }
     },
     roleLabel(role) {
       return { system: 'SYSTEM', user: 'USER', assistant: 'ASSISTANT', tool: 'TOOL', toolResult: 'RESULT' }[role] || (role || '').toUpperCase()

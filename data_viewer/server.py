@@ -1263,11 +1263,13 @@ def _load_simplified_trajectory(session: str, output_dir: str) -> Optional[dict]
 
 def _simplify_workspace_message(role: str, parts: list, msg: Optional[dict] = None) -> Optional[dict]:
     """把 workspace assistant/evaluator .jsonl 的一条 message 的 content 部件列表,
-    映射成前端已认的结构 {role, content, reasoning_content, tool_calls, truncated}。
+    映射成前端已认的结构 {role, content, reasoning_content, thinking_signatures, tool_calls, truncated}。
     部件类型: thinking / text / toolCall / (toolResult 侧的) text。
+    thinking 部件可选携带 thinkingSignature(opaque token), 单独透传供前端高亮显示。
     msg: 完整 message 对象, 用于捞出 content 之外的 message 层元数据
          (toolResult 的 toolName / isError / details.exitCode 等)。"""
     texts, reasonings, tool_calls = [], [], []
+    signatures = []
     for p in parts:
         if not isinstance(p, dict):
             continue
@@ -1278,6 +1280,9 @@ def _simplify_workspace_message(role: str, parts: list, msg: Optional[dict] = No
         elif t == "thinking":
             if p.get("thinking"):
                 reasonings.append(p["thinking"])
+            sig = p.get("thinkingSignature")
+            if sig:
+                signatures.append(sig)
         elif t == "toolCall":
             tool_calls.append({
                 "name": p.get("name"),
@@ -1297,6 +1302,8 @@ def _simplify_workspace_message(role: str, parts: list, msg: Optional[dict] = No
             reasoning = reasoning[:_MAX_MSG_CHARS]
             out["reasoning_truncated"] = True
         out["reasoning_content"] = reasoning
+    if signatures:
+        out["thinking_signatures"] = signatures
     if tool_calls:
         out["tool_calls"] = tool_calls
 
