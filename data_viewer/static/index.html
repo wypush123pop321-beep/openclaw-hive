@@ -361,16 +361,40 @@ body{
             <span v-else style="color:var(--text-2)">—</span>
           </template>
         </el-table-column>
-        <el-table-column label="工具失败" width="130" align="center">
+        <el-table-column label="工具失败轨迹数量/占比" width="160" align="center">
           <template #default="{row}">
-            <template v-if="row.tool_fail_stats">
+            <template v-if="toolFailState[row.id] && (toolFailState[row.id].running || toolFailState[row.id].queued)">
+              <div style="display:inline-flex;flex-direction:column;align-items:center;gap:3px">
+                <el-progress v-if="toolFailState[row.id].total > 0" :percentage="toolFailPercent(row.id)"
+                  :stroke-width="7" :show-text="false" style="width:104px"></el-progress>
+                <el-progress v-else :percentage="0" :stroke-width="7" :show-text="false" indeterminate
+                  style="width:104px"></el-progress>
+                <span style="font-size:11px;color:var(--text-2);line-height:1.2">{{ toolFailPhaseLabel(row.id) }}</span>
+              </div>
+            </template>
+            <template v-else-if="row.tool_fail_stats && 'traj_with_fail' in row.tool_fail_stats">
               <span style="font-family:ui-monospace,monospace;font-size:12px;color:var(--neon-red,#ff5c7c)"
-                :title="'口径=显式错误标记(openclaw: isError/exitCode; Hermes: ok=false/error/success=false/exit_code)。总调用 '+row.tool_fail_stats.total_tool_calls+' 次, 已分析 '+row.tool_fail_stats.analyzed_sessions+' 个 session'">
-                {{ (row.tool_fail_stats.total_tool_fails||0).toLocaleString() }}
+                :title="'口径=显式错误标记(openclaw: isError/exitCode; Hermes: ok=false/error/success=false/exit_code)。出现过调用失败的轨迹 '+row.tool_fail_stats.traj_with_fail+' / 总轨迹 '+row.tool_fail_stats.traj_total+' 条(原始: 失败调用 '+row.tool_fail_stats.total_tool_fails+' / 总调用 '+row.tool_fail_stats.total_tool_calls+' 次)'">
+                {{ (row.tool_fail_stats.traj_with_fail||0).toLocaleString() }}
                 <span style="color:var(--text-2);font-size:11px">/ {{ ((row.tool_fail_stats.fail_rate||0)*100).toFixed(1) }}%</span>
               </span>
             </template>
-            <span v-else style="color:var(--text-2)" title="尚未统计, 点操作列「统计工具失败」生成">—</span>
+            <span v-else style="color:var(--text-2)" :title="row.tool_fail_stats ? '旧口径统计已过期, 请重新点「统计工具失败」' : '尚未统计, 点操作列「统计工具失败」生成'">—</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="工具误用轨迹数/占比" width="200" align="center">
+          <template #default="{row}">
+            <template v-if="toolFailState[row.id] && (toolFailState[row.id].running || toolFailState[row.id].queued)">
+              <span style="font-size:11px;color:var(--text-2)">随「统计工具失败」一并计算</span>
+            </template>
+            <template v-else-if="row.win_stats && 'traj_with_win' in row.win_stats">
+              <span style="font-family:ui-monospace,monospace;font-size:12px;color:var(--neon-cyan,#4dd0e1)"
+                :title="'口径=轨迹内出现「工具误用/环境不符」调用(任务实际在 Linux openclaw 跑), 宽口径: ① 调用了本环境不存在的工具——toolResult 回「Tool X not found」, 任意 X 均计(Claude-Code/Windows 工具名 WebSearch/PowerShell/Glob…、被误当工具的 shell 命令 grep/curl/stat…、拼写幻觉); ② 入参含 file_path 键(Windows 版 write/read); ③ C:\\ 风格路径。出现该信号的轨迹 '+row.win_stats.traj_with_win+' / 总轨迹 '+row.win_stats.traj_total+' 条; 其中此类调用合计 '+row.win_stats.win_tool_calls+' / 总调用 '+row.win_stats.total_tool_calls+' 次'">
+                {{ (row.win_stats.traj_with_win||0).toLocaleString() }}
+                <span style="color:var(--text-2);font-size:11px">/ {{ ((row.win_stats.win_traj_rate||0)*100).toFixed(1) }}%</span>
+              </span>
+            </template>
+            <span v-else style="color:var(--text-2)" :title="row.win_stats ? '旧口径统计已过期, 请重新点「统计工具失败」' : '尚未统计, 点操作列「统计工具失败」生成'">—</span>
           </template>
         </el-table-column>
         <el-table-column label="状态" width="100" align="center">
@@ -382,14 +406,19 @@ body{
             <el-tag v-else type="info" size="small">未运行</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="440" align="center">
+        <el-table-column label="操作" width="560" align="center">
           <template #default="{row}">
             <el-button v-if="queuePosition(row.id) > 0" size="small" text type="danger" @click="cancelQueue(row)">取消排队</el-button>
             <el-button v-else size="small" text :disabled="jobStatus.running && jobStatus.task_id === row.id" @click="retriggerTask(row)">重新采集</el-button>
             <el-button size="small" text :disabled="!row.available" @click="downloadOrigin(row)">下载原始轨迹</el-button>
-            <el-button size="small" text :disabled="!row.available || (toolFailState[row.id] && toolFailState[row.id].running)"
+            <el-button size="small" text :disabled="!row.available || (toolFailState[row.id] && (toolFailState[row.id].running || toolFailState[row.id].queued))"
               :loading="toolFailState[row.id] && toolFailState[row.id].running" @click="analyzeToolFailures(row)">
-              {{ toolFailState[row.id] && toolFailState[row.id].running ? '统计中…' : '统计工具失败' }}
+              {{ toolFailState[row.id] && toolFailState[row.id].running ? '统计中…' : (toolFailState[row.id] && toolFailState[row.id].queued ? '排队中…' : '统计工具失败') }}
+            </el-button>
+            <el-button size="small" text type="warning" :disabled="!row.available || (toolFailState[row.id] && (toolFailState[row.id].running || toolFailState[row.id].queued))"
+              :loading="toolFailState[row.id] && toolFailState[row.id].running" @click="analyzeToolFailures(row, true)"
+              title="跳过增量下载，直接用本地已下载的轨迹统计（本地轨迹不完整时结果会偏少）">
+              {{ toolFailState[row.id] && toolFailState[row.id].running ? '统计中…' : (toolFailState[row.id] && toolFailState[row.id].queued ? '排队中…' : '跳过下载统计') }}
             </el-button>
             <el-button size="small" text @click="openRenameForm(row)">重命名</el-button>
             <el-button size="small" text @click="openGroupsForm(row)">编辑分组</el-button>
@@ -500,6 +529,18 @@ body{
               <span style="font-family:ui-monospace,monospace;font-size:12px;color:var(--neon-red,#ff5c7c)"
                 :title="'失败 '+row.tool_fail_count+' / 调用 '+(row.tool_calls||0)">
                 {{ row.tool_fail_count }}<span style="color:var(--text-2);font-size:11px"> / {{ row.tool_calls || 0 }}</span>
+              </span>
+            </template>
+            <span v-else style="color:var(--text-2)">—</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="工具误用" width="110" align="center">
+          <template #default="{row}">
+            <template v-if="row.win_tool_calls !== undefined && row.win_tool_calls !== null">
+              <span style="font-family:ui-monospace,monospace;font-size:12px"
+                :style="{color: (row.win_tool_calls>0 ? 'var(--neon-cyan,#4dd0e1)' : 'var(--text-2)')}"
+                :title="'口径(宽)=工具误用/环境不符调用: 调用了本环境不存在的工具(Tool X not found, 任意 X: Claude-Code/Windows 工具名、误当工具的 shell 命令、拼写幻觉) / file_path 入参键 / C:\\ 路径。本轨迹此类调用 '+row.win_tool_calls+' / 总调用 '+(row.tool_calls||0)">
+                {{ row.win_tool_calls }}<span style="color:var(--text-2);font-size:11px"> / {{ row.tool_calls || 0 }}</span>
               </span>
             </template>
             <span v-else style="color:var(--text-2)">—</span>
@@ -937,7 +978,7 @@ createApp({
       levelFilter: [],     // L0/L1/L1.5/L2/L3 层级筛选(多选)
       loading: false,
       jobStatus: {running: false, queue: [], queue_len: 0},
-      toolFailState: {},   // 工具失败统计: {taskId: {running, done, total}}, 后台线程进度轮询
+      toolFailState: {},   // 工具失败统计: {taskId: {running, done, total, phase}}, 后台线程进度轮询
       selectedSession: null,
       detailVisible: false,
       wsDownloading: false,  // 会话全量 workspace 打包下载中
@@ -1392,36 +1433,44 @@ createApp({
       document.body.removeChild(a)
       ElementPlus.ElMessage.success('已开始下载原始轨迹（数据较大，请耐心等待浏览器完成下载）')
     },
-    async analyzeToolFailures(task) {
+    async analyzeToolFailures(task, skipDownload = false) {
       // 触发后台「下载全量 assistant 轨迹 + 统计 tool_call 失败」, 随后轮询进度。
+      // skipDownload=true 时跳过增量下载, 直接用本地轨迹统计(快速路径)。
       if (!task.available) {
         ElementPlus.ElMessage.warning('该任务暂无可分析的轨迹数据')
         return
       }
       try {
-        const r = await axios.post(`/api/tasks/${task.id}/analyze-tool-failures`)
+        const r = await axios.post(`/api/tasks/${task.id}/analyze-tool-failures${skipDownload ? '?skip_download=true' : ''}`)
         if (!r.data.success) {
           ElementPlus.ElMessage.warning(r.data.message || '无法启动统计')
           return
         }
-        this.toolFailState[task.id] = { running: true, done: 0, total: 0 }
-        ElementPlus.ElMessage.success('已开始统计工具失败（需先下载全量轨迹，请稍候）')
+        // 全局单工人队列: 提交即排队(queued=true), 轮询会把状态带到 下载中→分析中→完成
+        this.toolFailState[task.id] = {
+          running: false, queued: true, queue_pos: r.data.queue_pos,
+          done: 0, total: 0, phase: 'queued',
+        }
+        ElementPlus.ElMessage.success(r.data.message || '已加入统计队列')
         this.pollToolFailure(task.id)
       } catch (e) {
         ElementPlus.ElMessage.error('启动统计失败: ' + (e.response?.data?.detail || e.message))
       }
     },
     pollToolFailure(taskId) {
-      // 轮询后台状态到结束, 完成后静默刷新任务列表(带出新的 tool_fail_stats)。
-      // 后端返回 {found, status:{running, done, total, error, result:{total_tool_fails, fail_rate,...}, finished_at}}
+      // 轮询后台状态到结束(含排队中), 完成后静默刷新任务列表(带出新的 tool_fail_stats)。
+      // 后端返回 {found, status:{running, queued, queue_pos, done, total, phase, error, result:{traj_with_fail, traj_total, fail_rate,...}, finished_at}}
+      let retries = 0
       const tick = async () => {
         try {
+          retries = 0
           const r = await axios.get(`/api/tasks/${taskId}/tool-failure-status`)
           const st = (r.data && r.data.status) || {}
           this.toolFailState[taskId] = {
-            running: !!st.running, done: st.done || 0, total: st.total || 0,
+            running: !!st.running, queued: !!st.queued, queue_pos: st.queue_pos,
+            done: st.done || 0, total: st.total || 0, phase: st.phase || '',
           }
-          if (st.running) {
+          if (st.running || st.queued) {
             setTimeout(tick, 2000)
             return
           }
@@ -1430,15 +1479,39 @@ createApp({
             ElementPlus.ElMessage.error('统计失败: ' + st.error)
           } else if (st.result) {
             ElementPlus.ElMessage.success(
-              `工具失败统计完成: 失败 ${st.result.total_tool_fails ?? '?'} 次, 失败率 ${((st.result.fail_rate || 0) * 100).toFixed(1)}%`)
+              `工具失败统计完成: ${st.result.traj_with_fail ?? '?'} / ${st.result.traj_total ?? '?'} 个轨迹出现调用失败(${((st.result.fail_rate || 0) * 100).toFixed(1)}%)`)
           }
           await this.loadTasks(true)
         } catch (e) {
+          // 瞬时网络错误不立即放弃: 连续最多重试 5 次(约 10s), 期间保持 running 进度显示。
+          if (retries < 5) {
+            retries += 1
+            setTimeout(tick, 2000)
+            return
+          }
           this.toolFailState[taskId] = { running: false }
           console.error('pollToolFailure', e)
         }
       }
       setTimeout(tick, 1500)
+    },
+    toolFailPercent(taskId) {
+      // 分析阶段的进度百分比(done/total)。total=0(下载中) 返回 0, 前端改用不确定条。
+      const st = this.toolFailState[taskId]
+      if (!st || !st.total) return 0
+      const pct = Math.round((st.done || 0) / st.total * 100)
+      return Math.max(0, Math.min(100, pct))
+    },
+    toolFailPhaseLabel(taskId) {
+      // 阶段文案: queued=排队等待(全局一次一个, 显示位次); download=补下轨迹
+      // (后端按已落盘轨迹 session 数近似上报百分比); analyze=逐 session 分析。
+      // total=0(如无 per_session)时回退无百分比提示。
+      const st = this.toolFailState[taskId]
+      if (!st) return ''
+      if (st.queued) return st.queue_pos ? `排队中（第${st.queue_pos}位）` : '排队中…'
+      if (st.phase === 'download') return st.total > 0 ? `下载中 ${this.toolFailPercent(taskId)}%` : '下载中…'
+      if (st.phase === 'analyze') return st.total > 0 ? `分析中 ${this.toolFailPercent(taskId)}%` : '分析中…'
+      return '统计中…'
     },
     async downloadSessionWorkspace() {
       // 全量 workspace 可能较大: 先 POST prepare 让后端后台拉取, 轮询到 ready 再触发浏览器原生下载。
@@ -1864,6 +1937,25 @@ createApp({
   async mounted() {
     await Promise.all([this.loadTasks(), this.loadStats(), this.loadJobStatus()])
     if (this.jobStatus.running || this.jobStatus.queue_len > 0) { this.startTicking(); this.startPollUntilDone() }
+    await this.resumeToolFailPolling()
+  },
+  async resumeToolFailPolling() {
+    // 页面刷新后 toolFailState 是空的: 逐个任务查后端运行态, 正在统计/排队中的恢复进度条并重启轮询,
+    // 否则「统计工具失败」在后台跑着, 刷新后进度彻底消失且完成后不会自动刷新。
+    const ids = [...new Set((this.tasks || []).map(t => t.id).filter(Boolean))]
+    for (const id of ids) {
+      try {
+        const r = await axios.get(`/api/tasks/${id}/tool-failure-status`)
+        const st = (r.data && r.data.status) || {}
+        if (st.running || st.queued) {
+          this.toolFailState[id] = {
+            running: !!st.running, queued: !!st.queued, queue_pos: st.queue_pos,
+            done: st.done || 0, total: st.total || 0, phase: st.phase || 'start',
+          }
+          this.pollToolFailure(id)
+        }
+      } catch (e) { /* 单个任务状态查询失败不阻塞其余任务 */ }
+    }
   },
 
   beforeUnmount() {

@@ -460,11 +460,102 @@ def _toolresult_msg_is_error(msg) -> bool:
     return False
 
 
-def count_tool_failures_openclaw(jsonl_path):
-    """遍历 openclaw assistant .jsonl(message 事件流), 返回 (tool_calls, tool_fails)。
-    tool_calls = assistant 消息里 toolCall 部件总数; tool_fails = 显式失败的 toolResult 数。"""
+# ── 工具误用 / 环境不符统计(宽口径) ──────────────────────────────────────────────
+# 任务实际跑在 Linux openclaw 环境。以下任一信号出现即视为一次「误用」, 命中任一即算:
+#   1. 调用了本环境不存在的工具: harness 回一条 role==toolResult 文本 "Tool X not found"。
+#      宽口径 —— 任意 X 都算(不分大小写), 因为每条都等于模型调了 openclaw 没有的工具:
+#        · Claude-Code/Windows 工具名: WebSearch / PowerShell / Glob / WebFetch /
+#          TaskCreate / EnterPlanMode / Agent / Skill / TodoWrite ...(模型以为在
+#          Claude-Code/Windows 环境);
+#        · 被误当工具直接调的 shell 命令: grep / find / cat / ls / curl / stat ...
+#          (正确应走 exec; 模型常先误调 not found、再改用 exec 重试);
+#        · 大小写/拼写变体与幻觉: webfetch / web_search / exce / filesever ...。
+#      这类调用 openclaw 不记成 toolCall 部件, 只在下一条 toolResult 留文本, 故检测走
+#      toolResult 文本(见 _tool_not_found_count), 而非 toolCall.name —— 后者在
+#      openclaw 词表(snake_case: read/exec/write...)下永远匹配不到。
+#   2. 入参含 file_path 键(Windows 版 write/read 用 file_path 作路径入参, Linux 版
+#      用 path)。
+#   3. 任一入参值为 Windows 风格路径: 盘符冒号斜杠开头(C:\\Users\\... 这种,
+#      Linux 是 /home/...)。
+# 规则 2/3 只深入「入参本身」, 不进入 content 正文载荷(HTML/脚本/JSON 文本里出现的
+# C:\\ 或 file_path 不代表调用发生在 Windows, 避免误报)。不区分调用成败。
+# WIN_TOOL_NAMES 保留给 toolCall.name 路径(_is_windows_tool_call); openclaw 实际靠
+# 规则 1 的 toolResult 扫描 + 规则 2 的 file_path 键命中。
+
+WIN_TOOL_NAMES = frozenset({
+    "powershell", "glob", "websearch", "webfetch", "taskcreate",
+})
+
+# 规则 1(宽口径): toolResult 文本里 "Tool X not found" 的次数, 任意 X 均计。
+# X 允许 字母/数字/下划线/点/连字符(覆盖 web_search、cmd.exe、web-search 等写法)。
+_TOOL_NOT_FOUND_RE = re.compile(r"Tool\s+([A-Za-z0-9_.\-]+)\s+not found")
+
+
+def _tool_not_found_count(text) -> int:
+    """toolResult 文本里 'Tool X not found' 的出现次数(宽口径: 任意 X 均计, 不分大小写,
+    含 Claude-Code/Windows 工具名、被误当工具的 shell 命令、拼写幻觉)。非字符串返回 0。"""
+    if not isinstance(text, str) or "not found" not in text:
+        return 0
+    return len(_TOOL_NOT_FOUND_RE.findall(text))
+_WIN_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
+_MAX_JSON_PARSE_LEN = 8192  # 超过此长度的字符串(如整段 HTML content)不做 JSON 解析
+
+
+def _is_win_path_value(value) -> bool:
+    """字符串值是否为 Windows 风格路径(盘符冒号斜杠开头)。非字符串返回 False。"""
+    if not isinstance(value, str):
+        return False
+    return bool(_WIN_PATH_RE.match(value.strip()))
+
+
+def _win_signal_in_args(args) -> bool:
+    """递归判断工具入参是否含 Windows 信号(file_path 键 / Windows 风格路径值)。
+
+    file_path 键与路径值都只在「非 content 载荷」分支里找: content 是正文大字符串,
+    其中的 C:\\ 与 file_path 均为内容而非 Windows 环境的证据。"""
+    if isinstance(args, dict):
+        for k, v in args.items():
+            if k == "file_path":
+                return True
+            if k == "content":
+                continue  # 正文载荷不参与判定
+            if _win_signal_in_args(v):
+                return True
+    elif isinstance(args, str):
+        s = args.strip()
+        if s[:1] in "{[" and len(s) <= _MAX_JSON_PARSE_LEN:
+            try:
+                if _win_signal_in_args(json.loads(s)):
+                    return True
+            except json.JSONDecodeError:
+                pass
+        if _is_win_path_value(s):
+            return True
+    elif isinstance(args, (list, tuple)):
+        return any(_win_signal_in_args(x) for x in args)
+    return False
+
+
+def _is_windows_tool_call(name, args) -> bool:
+    """单次工具调用是否为 Windows 环境: 工具名命中或入参命中显式信号。"""
+    if name and name.strip().lower() in WIN_TOOL_NAMES:
+        return True
+    return _win_signal_in_args(args)
+
+
+def count_tool_stats_openclaw(jsonl_path):
+    """单遍遍历 openclaw assistant .jsonl, 返回 (tool_calls, tool_fails, win_tool_calls)。
+
+    tool_calls = assistant 消息里 toolCall 部件总数(再加规则 1 检出的误用调用, 见下);
+    tool_fails = 显式失败的 toolResult 数(口径与 count_tool_failures_openclaw 一致);
+    win_tool_calls = 命中「工具误用/环境不符」信号的调用数(宽口径) = 规则 1(调用不存在的
+    工具: 扫 role==toolResult 文本里的 "Tool X not found", 任意 X 均计, 见
+    _tool_not_found_count) + 规则 2/3(file_path 入参 / Windows 风格路径, 见
+    _is_windows_tool_call, 作用于 toolCall 入参)。字段名沿用 win_* 仅为兼容。
+    """
     tool_calls = 0
     tool_fails = 0
+    win_calls = 0
     try:
         with open(jsonl_path, encoding="utf-8", errors="replace") as f:
             for line in f:
@@ -482,27 +573,49 @@ def count_tool_failures_openclaw(jsonl_path):
                 if role == "assistant":
                     content = msg.get("content")
                     if isinstance(content, list):
-                        tool_calls += sum(
-                            1 for p in content
-                            if isinstance(p, dict) and p.get("type") == "toolCall"
-                        )
+                        for p in content:
+                            if not isinstance(p, dict) or p.get("type") != "toolCall":
+                                continue
+                            tool_calls += 1
+                            if _is_windows_tool_call(
+                                p.get("name") or p.get("toolName") or "",
+                                p.get("arguments") if "arguments" in p else p.get("input"),
+                            ):
+                                win_calls += 1
                 elif role == "toolResult":
                     if _toolresult_msg_is_error(msg):
                         tool_fails += 1
+                    # 规则 1: "Tool X not found" 里 PascalCase 的 X = 一次误用 Windows/
+                    # Claude-Code 工具的调用。这类调用无对应 toolCall 部件, 故这里同时补进
+                    # tool_calls(分母)与 win_calls, 保证 win_rate ≤ 1。
+                    rc = msg.get("content")
+                    texts = ([p.get("text") for p in rc
+                              if isinstance(p, dict) and p.get("type") == "text"]
+                             if isinstance(rc, list)
+                             else [rc] if isinstance(rc, str) else [])
+                    for txt in texts:
+                        n = _tool_not_found_count(txt)
+                        if n:
+                            win_calls += n
+                            tool_calls += n
     except OSError:
-        return (0, 0)
-    return (tool_calls, tool_fails)
+        return (0, 0, 0)
+    return (tool_calls, tool_fails, win_calls)
 
 
-def count_tool_failures_query1(query1_path):
-    """遍历 Hermes query1.json 的 turns[].tool_calls[], 返回 (tool_calls, tool_fails)。"""
+def count_tool_stats_query1(query1_path):
+    """单遍遍历 Hermes query1.json 的 turns[].tool_calls[], 返回 (tool_calls, tool_fails,
+    win_tool_calls)。失败口径同 count_tool_failures_query1; 工具误用口径(宽) = 规则 1
+    (调用不存在的工具, best-effort 扫 output/agent_content 里的 "Tool X not found", 任意
+    X 均计, 见 _tool_not_found_count) + 规则 2/3(_is_windows_tool_call)。"""
     tool_calls = 0
     tool_fails = 0
+    win_calls = 0
     try:
         with open(query1_path, encoding="utf-8", errors="replace") as f:
             data = json.load(f)
     except (json.JSONDecodeError, OSError):
-        return (0, 0)
+        return (0, 0, 0)
     for t in (data.get("turns") or []):
         if not isinstance(t, dict):
             continue
@@ -512,7 +625,36 @@ def count_tool_failures_query1(query1_path):
             tool_calls += 1
             if _toolcall_output_is_error(tc.get("output")):
                 tool_fails += 1
-    return (tool_calls, tool_fails)
+            if _is_windows_tool_call(
+                tc.get("tool") or tc.get("name") or "",
+                tc.get("input") if "input" in tc else tc.get("arguments"),
+            ):
+                win_calls += 1
+            # 规则 1(best-effort): 误用工具的 "Tool X not found" 若落在本次 tool 的
+            # output 里, 也计一次 Windows 调用(Hermes 侧多为 JSON 字符串 output)。
+            out = tc.get("output")
+            if isinstance(out, str):
+                win_calls += _tool_not_found_count(out)
+        # 规则 1(best-effort): 有的 not-found 报错落在回合正文 agent_content 里。
+        ac = t.get("agent_content")
+        if isinstance(ac, str):
+            n = _tool_not_found_count(ac)
+            if n:
+                win_calls += n
+                tool_calls += n
+    return (tool_calls, tool_fails, win_calls)
+
+
+def count_tool_failures_openclaw(jsonl_path):
+    """(向后兼容包装) 遍历 openclaw assistant .jsonl, 返回 (tool_calls, tool_fails)。"""
+    c, f, _w = count_tool_stats_openclaw(jsonl_path)
+    return (c, f)
+
+
+def count_tool_failures_query1(query1_path):
+    """(向后兼容包装) 遍历 Hermes query1.json, 返回 (tool_calls, tool_fails)。"""
+    c, f, _w = count_tool_stats_query1(query1_path)
+    return (c, f)
 
 
 def extract_query1_verdict(path):

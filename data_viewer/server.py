@@ -113,9 +113,13 @@ _tasks_lock = threading.Lock()
 _stats_write_lock = threading.Lock()  # 串行化 filter_stats.json 的「读-改-写」, 防按需回填互相覆盖
 
 # ── 工具调用失败统计: 后台线程状态(按 task_id) ────────────────────────────────
-# 「统计工具失败」是重操作(需下载全量 assistant 轨迹再分析), 走后台线程, 前端轮询下面状态。
+# 「统计工具失败」是重操作(需下载全量 assistant 轨迹再分析), 全局单工人队列一次
+# 只跑一个任务(下载并发会打满带宽/obsutil), 前端轮询下面状态。phase 含 queued 时
+# 表示在排队尚未开始; queue_pos 由 /tool-failure-status 按队列快照动态算。
 _toolfail_lock = threading.Lock()
-_toolfail_state = {}  # task_id -> {running, done, total, error, result, finished_at}
+_toolfail_state = {}  # task_id -> {running, queued, done, total, phase, error, result, finished_at}
+_toolfail_queue = deque()
+_toolfail_queue_cond = threading.Condition(_toolfail_lock)
 
 # ── 会话全量 workspace 下载: 后台准备 + 就绪后流式打包 ─────────────────────────
 # 下载单个 session 的完整 workspace 可能较大, 先用后台线程 obsutil 拉到临时目录,
@@ -602,6 +606,8 @@ def _startup():
     migrate_legacy_task_if_needed()
     # 单一采集 worker: 消费采集队列, 按登记顺序逐个下载
     threading.Thread(target=_pipeline_worker, daemon=True).start()
+    # 单一工具失败统计 worker: 全局一次一个, 排队下载全量轨迹(防并发打满带宽)
+    threading.Thread(target=_toolfail_worker, daemon=True).start()
     # 后台异步回填旧任务的 token_stats / task_done_count，避免阻塞 startup
     threading.Thread(target=_backfill_token_stats, daemon=True).start()
     threading.Thread(target=_backfill_task_done, daemon=True).start()
@@ -823,6 +829,9 @@ def _task_summary(task: dict) -> dict:
         # 工具调用失败统计(需先点「统计工具失败」生成; 未生成时缺省, 前端显示 —)
         if data.get("tool_fail_stats"):
             summary["tool_fail_stats"] = data["tool_fail_stats"]
+        # Windows 工具调用统计(与 tool_fail_stats 同一次「统计工具失败」一并生成)
+        if data.get("win_stats"):
+            summary["win_stats"] = data["win_stats"]
     else:
         summary["available"] = False
         summary["session_total"] = 0
@@ -2158,28 +2167,58 @@ def _iter_tar_stream(root_dir: Path, arcname: str, chunk_size: int = 1024 * 1024
         yield b"".join(buf.chunks)
 
 
+def _toolfail_worker():
+    """单一后台 worker: 空队列时阻塞等待, 有任务则取队首逐个运行(严格 FIFO)。
+    一次只跑一个「统计工具失败」, 避免多个任务并发下载全量轨迹打满带宽。"""
+    while True:
+        with _toolfail_lock:
+            while not _toolfail_queue:
+                _toolfail_queue_cond.wait()
+            task = _toolfail_queue.popleft()
+            tid = task["id"]
+            st = _toolfail_state.get(tid) or {}
+            st.update({"running": True, "queued": False, "phase": "start"})
+            _toolfail_state[tid] = st
+        try:
+            _run_tool_failure_analysis(task)
+        except Exception as exc:  # noqa: BLE001  单个任务异常不拖垮 worker, 继续下一个
+            print(f"[toolfail] 统计异常 task_id={tid}: {exc}")
+            with _toolfail_lock:
+                st = _toolfail_state.get(tid) or {}
+                st.update({"running": False, "queued": False, "error": f"统计线程异常: {exc}", "result": None})
+                _toolfail_state[tid] = st
+
+
 def _run_tool_failure_analysis(task: dict):
     """后台线程: 下载全量 assistant 轨迹 + 统计 tool_call 失败, 写回 filter_stats.json。
     进度/结果写入 _toolfail_state[task_id] 供前端轮询。"""
     import analyze_tool_failures  # 延迟导入, 避免与 server 循环导入
     tid = task["id"]
 
-    def progress(done, total):
+    def progress(done, total, phase=None):
         with _toolfail_lock:
             st = _toolfail_state.get(tid)
             if st is not None:
                 st["done"] = done
                 st["total"] = total
+                if phase:
+                    st["phase"] = phase
 
     try:
         now_iso = datetime.now(timezone.utc).isoformat()
         with _stats_write_lock:  # 与 char_len/token 回填串行, 防 filter_stats.json 互相覆盖
-            result = analyze_tool_failures.analyze(task, progress=progress, now_iso=now_iso)
+            result = analyze_tool_failures.analyze(
+                task, progress=progress, now_iso=now_iso,
+                skip_download=task.get("_skip_download", False))
         with _toolfail_lock:
+            # done/total 沿用采集循环最后一次上报的进度(全部 session 处理完 = 总 session 数),
+            # 不再用 analyzed_sessions 覆盖 —— analyzed_sessions 现只统计有轨迹数据的 session,
+            # 用它覆盖会让完成态的 done/total 比运行中回退, 语义不一致。
+            prev = _toolfail_state.get(tid, {})
             _toolfail_state[tid] = {
-                "running": False, "done": result.get("analyzed_sessions", 0),
-                "total": result.get("analyzed_sessions", 0), "error": None,
-                "result": result, "finished_at": now_iso,
+                "running": False, "done": prev.get("done", 0),
+                "total": prev.get("total", 0), "error": None,
+                "result": result, "phase": "done", "finished_at": now_iso,
             }
     except Exception as e:  # noqa: BLE001  失败也要落到状态里让前端看到
         with _toolfail_lock:
@@ -2189,8 +2228,9 @@ def _run_tool_failure_analysis(task: dict):
 
 
 @app.post("/api/tasks/{task_id}/analyze-tool-failures")
-def api_analyze_tool_failures(task_id: str):
-    """触发「统计工具失败」: 起后台线程下载全量 assistant 轨迹并统计失败次数。"""
+def api_analyze_tool_failures(task_id: str, skip_download: bool = False):
+    """触发「统计工具失败」: 入全局单工人队列(一次一个), 下载全量 assistant 轨迹并统计失败情况(轨迹口径)。
+    skip_download=true 时跳过增量下载(本地轨迹已齐全的快速路径), 直接逐 session 分析。"""
     task = find_task(task_id)
     if not task:
         return JSONResponse({"success": False, "message": "任务不存在"}, status_code=404)
@@ -2199,24 +2239,40 @@ def api_analyze_tool_failures(task_id: str):
             {"success": False, "message": "仅 workspace 来源的任务支持工具失败统计"},
             status_code=400,
         )
+    qtask = dict(task)
+    qtask["_skip_download"] = skip_download
     with _toolfail_lock:
         st = _toolfail_state.get(task_id)
-        if st and st.get("running"):
-            return {"success": False, "message": "该任务正在统计工具失败，请稍候"}
+        if st and (st.get("running") or st.get("queued")):
+            return {"success": False, "message": "该任务正在统计工具失败（或已在排队），请勿重复提交"}
         _toolfail_state[task_id] = {
-            "running": True, "done": 0, "total": 0,
+            "running": False, "done": 0, "total": 0, "phase": "queued", "queued": True,
             "error": None, "result": None, "finished_at": None,
         }
-    threading.Thread(target=_run_tool_failure_analysis, args=(task,), daemon=True).start()
-    return {"success": True, "message": "已开始统计工具失败（后台下载轨迹并分析，请稍候）"}
+        _toolfail_queue.append(qtask)
+        pos = len(_toolfail_queue)
+        _toolfail_queue_cond.notify()
+    if skip_download:
+        return {"success": True, "queued": True, "queue_pos": pos,
+                "message": "已加入统计队列（跳过下载，直接用本地轨迹分析，请稍候）"}
+    return {"success": True, "queued": True, "queue_pos": pos,
+            "message": "已加入统计队列（全局一次一个，串行下载并分析，请稍候）"}
 
 
 @app.get("/api/tasks/{task_id}/tool-failure-status")
 def api_tool_failure_status(task_id: str):
-    """前端轮询「统计工具失败」进度/结果。无记录表示从未触发过。"""
+    """前端轮询「统计工具失败」进度/结果。无记录表示从未触发过。
+    queued 时 queue_pos 为当前队列位次(1-based, 含自己)。"""
     with _toolfail_lock:
         st = _toolfail_state.get(task_id)
-        return {"found": st is not None, "status": dict(st) if st else None}
+        if st is None:
+            return {"found": False, "status": None}
+        st = dict(st)
+        st["queue_pos"] = None
+        if st.get("queued") or st.get("phase") == "queued":
+            st["queue_pos"] = next(
+                (i + 1 for i, t in enumerate(_toolfail_queue) if t.get("id") == task_id), None)
+        return {"found": True, "status": st}
 
 
 @app.get("/api/tasks/{task_id}/download-origin")
@@ -2763,7 +2819,12 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 @app.get("/{full_path:path}")
 def serve_index(full_path: str):
-    return FileResponse(str(STATIC_DIR / "index.html"))
+    # index.html 禁止缓存复用: 前端逻辑迭代频繁, 浏览器启发式缓存旧 HTML 会导致
+    # 刷新后拿不到新逻辑(如刷新后恢复统计进度轮询)。no-cache = 可存但每次回源校验。
+    return FileResponse(
+        str(STATIC_DIR / "index.html"),
+        headers={"Cache-Control": "no-cache, must-revalidate"},
+    )
 
 
 if __name__ == "__main__":
