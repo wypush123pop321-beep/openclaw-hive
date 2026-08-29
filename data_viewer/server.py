@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import base64
 import importlib.util
 import io
 import json
@@ -36,6 +37,9 @@ CONFIG_FILE = HERE / "config.json"
 OBS_PROFILES_FILE = HERE / "obs_profiles.json"  # 额外 OBS 账号/桶凭证, gitignored, 不提交
 TASKS_FILE = HERE / "tasks.json"
 STATS_FILE_NAME = "filter_stats.json"
+# 老化(archive)时删除的实际数据目录: 只保留 filter_stats.json 里的统计信息, 最大化节省磁盘。
+# origin=原始轨迹(可能 GB 级), _sigdecode=signature 解码产物, 均可按需从 OBS 重新拉取。
+AGED_REMOVE_DIRS = ("origin", "_sigdecode")
 
 DEFAULT_CONFIG = {
     "output_base_dir": str(HERE / "pipeline_output"),
@@ -319,6 +323,27 @@ def delete_task_data(output_dir: str):
                 target.unlink()
     elif out_dir.exists():
         shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def age_task_data(output_dir: str) -> list:
+    """老化: 只保留前端展示的统计信息(filter_stats.json 与 tasks.json 元数据),
+    删除实际数据文件(origin 原始轨迹 / _sigdecode 解码产物), 最大化节省磁盘。
+    返回实际删除的目录名列表。老化后统计照常展示, 但无法再查看/下载具体轨迹。"""
+    removed = []
+    out_dir = Path(output_dir).resolve()
+    for name in AGED_REMOVE_DIRS:
+        target = out_dir / name
+        if target.is_dir():
+            shutil.rmtree(target, ignore_errors=True)
+            removed.append(name)
+        elif target.exists():
+            target.unlink()
+            removed.append(name)
+    return removed
+
+
+def task_is_aged(task: dict) -> bool:
+    return bool(task.get("aged"))
 
 
 def migrate_legacy_task_if_needed():
@@ -1046,6 +1071,10 @@ def api_trigger_task(task_id: str, body: dict = None):
             status_code=400,
         )
 
+    # 老化后的任务重新采集会重建 origin/统计, 先清除老化标记
+    if task.get("aged"):
+        update_task(task_id, aged=False, aged_at=None)
+
     enq = _enqueue_pipeline(task_id, ssh_passwords)
     if enq["state"] == "running":
         return {"success": False, "message": "该任务正在采集中"}
@@ -1104,6 +1133,46 @@ def api_delete_task(task_id: str):
     tasks = [t for t in load_tasks() if t["id"] != task_id]
     save_tasks(tasks)
     return {"success": True, "message": "任务已删除"}
+
+
+@app.post("/api/tasks/{task_id}/age")
+def api_age_task(task_id: str):
+    """老化: 仅保留前端展示的统计信息(filter_stats.json), 删除实际原始数据文件
+    (origin 原始轨迹 / _sigdecode 解码产物), 最大化节省磁盘。
+    统计照常展示, 但无法再查看/下载具体轨迹, 也无法再跑工具失败统计/签名解码/缓存 workspace。"""
+    task = find_task(task_id)
+    if not task:
+        return JSONResponse({"success": False, "message": "任务不存在"}, status_code=404)
+
+    with _job_lock:
+        if _job_state["running"] and _job_state["task_id"] == task_id:
+            return JSONResponse(
+                {"success": False, "message": "该任务正在采集中，无法老化，请等待采集结束"},
+                status_code=409,
+            )
+
+    # 正在「统计工具失败」时不可老化(它在往 origin 写数据); 若仅排队则先出队
+    with _toolfail_lock:
+        st = _toolfail_state.get(task_id)
+        if st and st.get("running"):
+            return JSONResponse(
+                {"success": False, "message": "该任务正在统计工具失败，无法老化，请等待完成"},
+                status_code=409,
+            )
+        kept = [t for t in _toolfail_queue if t["id"] != task_id]
+        if len(kept) < len(_toolfail_queue):
+            _toolfail_queue.clear()
+            _toolfail_queue.extend(kept)
+        _toolfail_state.pop(task_id, None)
+
+    _remove_from_queue(task_id)   # 若在采集队列里排队, 先出队再删数据
+    removed = age_task_data(task["output_dir"])
+    update_task(task_id, aged=True, aged_at=datetime.now().isoformat())
+    if removed:
+        message = "任务已老化: 删除原始数据 " + "、".join(removed) + "，保留统计信息"
+    else:
+        message = "任务已老化(未找到需删除的原始数据，仅更新标记)"
+    return {"success": True, "message": message, "removed": removed, "task": find_task(task_id)}
 
 
 @app.get("/api/stats")
@@ -1284,6 +1353,37 @@ def _load_simplified_trajectory(session: str, output_dir: str) -> Optional[dict]
 
 # ── workspace 来源的轨迹查看(assistant .jsonl + log 裁决 + 按需拉 evaluator) ──────
 
+# ── signature 合规校验(默认解析: base64 解码后校验 model name 是否含 "claude") ──
+# 规则: thinkingSignature base64 解码后, protobuf 内层元数据含 model name。
+# 真实 claude 推理节点产出的签名解码后稳定出现 "claude-opus-…" 字样。
+#   ok       解码成功且含 claude          → 合规
+#   mismatch 解码成功但不含 claude        → 疑似非 claude 模型(违反规则)
+#   corrupt  base64 解码失败(截断/污染)   → 签名损坏, 无法判定
+_SIG_KEYWORD = "claude"
+_OTHER_MODEL_HINTS = ("glm", "gpt", "qwen", "gemini", "deepseek", "ernie", "doubao")
+
+
+def _check_signature_claude(sig: str) -> dict:
+    """对单个 thinkingSignature 做默认解析, 返回 {verdict, model_hint}。"""
+    if not sig:
+        return {"verdict": "corrupt", "model_hint": ""}
+    try:
+        raw = base64.b64decode(sig)
+    except Exception:
+        return {"verdict": "corrupt", "model_hint": ""}
+    info = "".join(chr(b) if 32 <= b < 127 else "." for b in raw)
+    low = info.lower()
+    idx = low.find(_SIG_KEYWORD)
+    if idx >= 0:
+        return {"verdict": "ok", "model_hint": info[idx: idx + 32]}
+    # 解出正常文本但不含 claude: 尝试标出识别到的其它模型名
+    for kw in _OTHER_MODEL_HINTS:
+        j = low.find(kw)
+        if j >= 0:
+            return {"verdict": "mismatch", "model_hint": info[j: j + 32]}
+    return {"verdict": "mismatch", "model_hint": ""}
+
+
 def _simplify_workspace_message(role: str, parts: list, msg: Optional[dict] = None) -> Optional[dict]:
     """把 workspace assistant/evaluator .jsonl 的一条 message 的 content 部件列表,
     映射成前端已认的结构 {role, content, reasoning_content, thinking_signatures, tool_calls, truncated}。
@@ -1327,6 +1427,7 @@ def _simplify_workspace_message(role: str, parts: list, msg: Optional[dict] = No
         out["reasoning_content"] = reasoning
     if signatures:
         out["thinking_signatures"] = signatures
+        out["signature_checks"] = [_check_signature_claude(s) for s in signatures]
     if tool_calls:
         out["tool_calls"] = tool_calls
 
@@ -1442,6 +1543,312 @@ def _load_workspace_assistant(session: str, output_dir: str) -> Optional[dict]:
             if traj:
                 return traj
     return None
+
+
+# ── 指定文件打开轨迹(独立于任务/会话) ──────────────────────────────────────────
+# 上限常量: 单文件最多解析的完整轨迹数 / 单条轨迹最多保留的消息数, 防止超大切崩前端。
+_MAX_FILE_MSGS = 2000
+
+
+def _tool_call_flat_to_parts(tc) -> Optional[dict]:
+    """把 reflected 扁平格式的 tool_calls 条目归一化为前端工具调用结构。
+    兼容两种形态: workspace 风格 {name, arguments} 与 OpenAI 风格 {type:'function', function:{name, arguments}};
+    缺 name 的条目丢弃。arguments 若是 dict/list 则序列化为字符串, 方便前端直接展示。"""
+    if not isinstance(tc, dict):
+        return None
+    fn = tc.get("function") if isinstance(tc.get("function"), dict) else tc
+    name = fn.get("name")
+    if not name:
+        return None
+    args = fn.get("arguments")
+    if isinstance(args, (dict, list)):
+        args = json.dumps(args, ensure_ascii=False)
+    return {"name": name, "arguments": args}
+
+
+def _load_reflected_message(msg: dict, role: str) -> Optional[dict]:
+    """把 reflected 对话 dump 里的一条 message 转成前端渲染结构。
+    content 可能是字符串(user/assistant/tool)或部件列表(assistant thinking/text/toolCall),
+    复用 _simplify_workspace_message 处理部件列表。
+    reflected 平铺格式下 reasoning_content / tool_calls 是 content 的兄弟键(思考型模型 content 常为空),
+    一并提取透传, 否则轨迹面板会出现大段"空 assistant"。"""
+    content = msg.get("content")
+    if isinstance(content, str):
+        text = content
+        truncated = False
+        if len(text) > _MAX_MSG_CHARS:
+            text = text[:_MAX_MSG_CHARS]
+            truncated = True
+        out = {"role": role, "content": text, "truncated": truncated}
+    elif isinstance(content, list):
+        out = _simplify_workspace_message(role, content, msg)
+        if out is None:
+            return None
+    elif content is None and role in ("assistant", "tool"):
+        out = {"role": role, "content": "", "truncated": False}
+    else:
+        return None
+
+    # reflected 平铺字段: 消息级 reasoning_content(思考) 与 tool_calls(工具调用)
+    reasoning = msg.get("reasoning_content")
+    if reasoning and role == "assistant":
+        if isinstance(reasoning, str):
+            r_text = reasoning
+        elif isinstance(reasoning, list):
+            r_text = "\n".join(str(p) for p in reasoning if isinstance(p, str) and p)
+        else:
+            r_text = None
+        if r_text:
+            if len(r_text) > _MAX_MSG_CHARS:
+                r_text = r_text[:_MAX_MSG_CHARS]
+                out["reasoning_truncated"] = True
+            out["reasoning_content"] = r_text
+
+    tcs = msg.get("tool_calls")
+    if isinstance(tcs, list) and tcs:
+        norm = [t for t in (_tool_call_flat_to_parts(tc) for tc in tcs) if t]
+        if norm:
+            out["tool_calls"] = norm
+    return out
+
+
+def _reflected_traj_meta(meta_info: dict) -> Optional[dict]:
+    """从 reflected 格式的 meta_info 提炼选择器展示用的精简元信息。"""
+    if not isinstance(meta_info, dict):
+        return None
+    ui = meta_info.get("unique_info") or {}
+    info = ui.get("info") or {}
+    out = {
+        "rounds": meta_info.get("rounds"),
+        "category": meta_info.get("category"),
+        "language": meta_info.get("language"),
+        "query_source": meta_info.get("query_source"),
+        "is_skill": ui.get("is_skill"),
+        "path": ui.get("path"),
+    }
+    for k in ("complete_result", "correct_result", "number_of_turns", "tokens", "tool_num", "assistant_num"):
+        if info.get(k) is not None:
+            out[k] = info.get(k)
+    return out
+
+
+def _load_reflected_conversation(obj: dict, index: int) -> Optional[dict]:
+    """把一行 reflected 对话 dump {version, messages, tools, meta_info} 裁剪为前端轨迹结构。"""
+    msgs = obj.get("messages")
+    if not isinstance(msgs, list) or not msgs:
+        return None
+    parsed = []
+    for m in msgs:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        if role not in ("system", "user", "assistant", "tool"):
+            continue
+        out = _load_reflected_message(m, role)
+        if out:
+            parsed.append(out)
+        if len(parsed) >= _MAX_FILE_MSGS:
+            break
+    if not parsed:
+        return None
+    meta = _reflected_traj_meta(obj.get("meta_info"))
+    return {
+        "index": index,
+        "session": f"轨迹 {index + 1}",
+        "message_count": len(parsed),
+        "messages": parsed,
+        "meta": meta,
+    }
+
+
+def _file_too_large(p: Path) -> Optional[dict]:
+    """体积上限检查: 仅对需要把整个文件读入内存的格式(workspace 事件流 / 单 JSON)生效。
+    reflected 惰性分页按行有界读取(每页只读 limit+1 条), 文件再大也能秒开, 不再受此限制。"""
+    try:
+        size = p.stat().st_size
+        if size > 200 * 1024 * 1024:
+            return {"found": False, "message": f"文件过大({size // 1024 // 1024}MB)，超过 200MB 上限"}
+    except OSError:
+        pass
+    return None
+
+
+def _unwrap_rejected_record(obj: dict, fmt: str):
+    """rejected 拒检报告行({source_file, line_no, reject_reasons, record}) → (record 对话, QC 元信息)。
+    其它格式原样返回 (obj, None); rejected 行缺 record/record 非对象时返回 (None, None), 调用方按坏行跳过。"""
+    if fmt != "rejected":
+        return obj, None
+    rec = obj.get("record")
+    if not isinstance(rec, dict):
+        return None, None
+    reasons = obj.get("reject_reasons")
+    qc = {
+        "source_file": obj.get("source_file"),
+        "line_no": obj.get("line_no"),
+        "reject_reasons": reasons if isinstance(reasons, list) else None,
+    }
+    return rec, qc
+
+
+def _attach_qc_meta(traj: dict, qc: Optional[dict]) -> dict:
+    """把 QC 拒检元信息并入轨迹 meta.reject(前端列表项/头部展示用); qc 为空时原样返回。"""
+    if not qc:
+        return traj
+    traj = dict(traj)
+    meta = dict(traj.get("meta") or {})
+    meta["reject"] = qc
+    traj["meta"] = meta
+    return traj
+
+
+def _load_arbitrary_trajectory_file(path: str, offset: int = 0, limit: int = 10,
+                                    start: int = 0, jump: Optional[int] = None) -> Optional[dict]:
+    """打开任意本地轨迹文件并解析成前端渲染结构(独立于任务/会话)。
+    支持四种格式:
+      - reflected / 对话 dump: 每行一个完整对话 {version, messages, tools, meta_info};
+      - workspace 事件流: 每行 {type:'message', message:{...}}(复用 _load_workspace_jsonl_trajectory);
+      - 单对象 JSON: 文件本身就是 {messages:[...]}(按单条对话处理);
+      - rejected 拒检报告: 每行 {source_file, line_no, reject_reasons, record}, record 为 reflected 对话
+        (解包 record 渲染, 并把 source_file/line_no/reject_reasons 并入 meta.reject 展示)。
+    reflected/rejected 格式按惰性分页读取(秒开):
+      - offset/start: 续读模式, offset=本页起读行号(1 起, 首页 0), start=本页首条轨迹的全局序号;
+      - jump: 跳页模式, 从文件头数起跳过前 jump 条有效轨迹(空行/坏行不计, 故不能按行号算),
+        再取 limit 条。目标页超出范围时返回 found:False 并附带最大页数。
+    limit=每页最多解析条数; 只读到 limit+1 条有效轨迹即停, 不扫描全文件, 也不统计总数。
+    200MB 体积上限仅对整体读入的 workspace/单 JSON 生效; reflected 按行有界读取, 不再受限。
+    返回 {found, source_file, format, offset, start, count, has_more, next_offset, trajectories, message}。
+    trajectories 每项结构同 _load_workspace_jsonl_trajectory 的返回(外加 meta), 前端直接复用消息渲染。"""
+    p = Path(path).expanduser().resolve()
+    if not p.exists() or not p.is_file():
+        return None
+
+    # 先读首个非空行判断格式
+    first = None
+    with open(p, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                first = line
+                break
+    if not first:
+        return {"found": False, "message": "文件为空"}
+    try:
+        probe = json.loads(first)
+    except json.JSONDecodeError:
+        # 非 jsonl: 尝试整个文件作为单个 JSON 对象(整体读入, 保留体积上限)
+        err = _file_too_large(p)
+        if err:
+            return err
+        try:
+            with open(p, encoding="utf-8", errors="replace") as f:
+                whole = json.loads(f.read())
+            if isinstance(whole.get("messages"), list):
+                traj = _load_reflected_conversation(whole, 0)
+                if traj:
+                    return {"found": True, "source_file": str(p), "format": "single",
+                            "offset": 0, "start": 0, "count": 1, "has_more": False,
+                            "next_offset": 0, "trajectories": [traj]}
+        except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
+            pass
+        return {"found": False, "message": "无法解析该文件(非 JSON/JSONL 轨迹格式)"}
+
+    # 格式判定
+    if isinstance(probe.get("messages"), list):
+        fmt = "reflected"
+    elif "type" in probe:
+        fmt = "workspace"
+    elif isinstance(probe.get("record"), dict) and isinstance(probe["record"].get("messages"), list):
+        fmt = "rejected"
+    else:
+        return {"found": False, "message": "无法识别的轨迹格式(每行需含 messages/type/record 字段)"}
+
+    if fmt == "workspace":
+        # workspace 事件流需要把整个文件读入解析, 保留体积上限
+        err = _file_too_large(p)
+        if err:
+            return err
+        traj = _load_workspace_jsonl_trajectory(p, p.stem)
+        if not traj:
+            return {"found": False, "message": "workspace 事件流解析失败(无任何 message 行)"}
+        traj = dict(traj)
+        traj.setdefault("index", 0)
+        traj["meta"] = None
+        return {"found": True, "source_file": str(p), "format": "workspace",
+                "offset": 0, "start": 0, "count": 1, "has_more": False,
+                "next_offset": 0, "trajectories": [traj]}
+
+    # reflected: 惰性分页逐行解析, 只读 limit+1 条有效轨迹即停, 不统计总数
+    trajectories = []
+    has_more = False
+    line_no = 0
+    page_start = jump if jump is not None else start   # 本页首条轨迹的全局序号
+    if jump is not None:
+        # 跳页模式: 从文件头数起跳过前 jump 条有效轨迹(空行/坏行不计, 故不能按行号算)
+        skipped = 0
+        with open(p, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line_no += 1
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                obj, qc = _unwrap_rejected_record(obj, fmt)
+                if not isinstance(obj, dict) or not isinstance(obj.get("messages"), list):
+                    continue
+                if skipped < jump:
+                    skipped += 1
+                    continue
+                if len(trajectories) >= limit:
+                    has_more = True               # 本页已读满, 又碰到一条有效轨迹 → 还有下一页
+                    break
+                traj = _load_reflected_conversation(obj, jump + len(trajectories))
+                if traj:
+                    trajectories.append(_attach_qc_meta(traj, qc))
+        if not trajectories and skipped <= jump:
+            # 目标页超出范围: 跳过头也没到(或恰好跳过最后一个), 顺带统计出真实总数/最大页数
+            total = skipped
+            max_page = (total + limit - 1) // limit if total else 0
+            return {"found": False,
+                    "message": f"跳转页码超出范围：文件共 {total} 条轨迹，最多 {max_page} 页"}
+    else:
+        # 续读模式: 从 offset 行继续(offset 为下页起读行号, 含该行), 只读 limit+1 条有效轨迹即停
+        with open(p, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line_no += 1
+                if line_no < offset:
+                    continue
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                obj, qc = _unwrap_rejected_record(obj, fmt)
+                if not isinstance(obj, dict) or not isinstance(obj.get("messages"), list):
+                    continue
+                if len(trajectories) >= limit:
+                    has_more = True               # 本页已读满, 又碰到一条有效轨迹 → 还有下一页
+                    break
+                traj = _load_reflected_conversation(obj, start + len(trajectories))
+                if traj:
+                    trajectories.append(_attach_qc_meta(traj, qc))
+    # 续读起点: 命中 probe 行时从该行续读(该行未回传, 下一批要包含它); 自然读尽时给出 EOF 之后的行号
+    next_offset = line_no if has_more else line_no + 1
+
+    if not trajectories:
+        if offset > 0:
+            # 续读页没有更多有效轨迹(正常收尾或文件被改写等), 前端据此隐藏「加载下一页」
+            return {"found": True, "source_file": str(p), "format": fmt,
+                    "offset": offset, "start": page_start, "count": 0, "has_more": False,
+                    "next_offset": next_offset, "trajectories": []}
+        return {"found": False, "message": "文件内没有任何可解析的对话轨迹"}
+    return {"found": True, "source_file": str(p), "format": fmt,
+            "offset": offset, "start": page_start, "count": len(trajectories),
+            "has_more": has_more, "next_offset": next_offset, "trajectories": trajectories}
 
 
 def _extract_verdict_from_log(session: str, output_dir: str) -> Optional[dict]:
@@ -2035,6 +2442,9 @@ def api_task_session_detail(task_id: str, session: str, eval_qc: Optional[str] =
     task = find_task(task_id)
     if not task:
         return JSONResponse({"found": False, "message": "任务不存在"}, status_code=404)
+    if task_is_aged(task):
+        return JSONResponse({"found": False, "message": "该任务已老化，原始轨迹数据已删除，仅保留统计信息"},
+                            status_code=410)
 
     if task.get("source_type") == "workspace":
         # 快速路径采集下 origin 无具体轨迹, 首次查看时按需下载该 session 的 assistant 文件
@@ -2099,6 +2509,28 @@ def api_task_session_detail(task_id: str, session: str, eval_qc: Optional[str] =
     return result
 
 
+@app.get("/api/load-trajectory-file")
+def api_load_trajectory_file(path: str, offset: int = 0, limit: int = 10, start: int = 0,
+                             jump: Optional[int] = None):
+    """打开指定本地轨迹文件(.jsonl / .json)并返回前端渲染结构, 独立于任务/会话。
+    path 为绝对路径; 支持 reflected 对话 dump(每行一完整对话)、workspace 事件流、单 JSON 三种格式。
+    reflected 格式惰性分页: offset=本页起读行号(1 起, 首页 0), start=本页首条轨迹的全局序号, limit=每页条数;
+    传 jump(跳过前 N 条有效轨迹)为跳页模式, 目标页超出范围时返回 400 并附最大页数。"""
+    if not path or not path.strip():
+        return JSONResponse({"found": False, "message": "未指定轨迹文件路径"}, status_code=400)
+    limit = max(1, min(limit, 100))
+    offset = max(0, offset)
+    start = max(0, start)
+    if jump is not None:
+        jump = max(0, jump)
+    result = _load_arbitrary_trajectory_file(path.strip(), offset=offset, limit=limit, start=start, jump=jump)
+    if not result:
+        return JSONResponse({"found": False, "message": f"文件不存在或不可读: {path.strip()}"}, status_code=404)
+    if not result.get("found"):
+        return JSONResponse(result, status_code=400)
+    return result
+
+
 @app.get("/api/tasks/{task_id}/session-log/{session}")
 def api_task_session_log(task_id: str, session: str):
     """返回该 session 的主 log 文本(与 assistant/evaluator 轨迹同级的「任务 Log」标签)。
@@ -2106,6 +2538,9 @@ def api_task_session_log(task_id: str, session: str):
     task = find_task(task_id)
     if not task:
         return JSONResponse({"found": False, "message": "任务不存在"}, status_code=404)
+    if task_is_aged(task):
+        return JSONResponse({"found": False, "message": "该任务已老化，原始 log 数据已删除，仅保留统计信息"},
+                            status_code=410)
     if task.get("source_type") != "workspace":
         return JSONResponse({"found": False, "message": "该来源无独立 log 文件"}, status_code=404)
 
@@ -2176,6 +2611,11 @@ def _toolfail_worker():
                 _toolfail_queue_cond.wait()
             task = _toolfail_queue.popleft()
             tid = task["id"]
+            # 老化后数据已删, 直接跳过(老化端点也会把该任务移出队列, 这里只是竞态兜底)
+            current = find_task(tid)
+            if current and task_is_aged(current):
+                _toolfail_state.pop(tid, None)
+                continue
             st = _toolfail_state.get(tid) or {}
             st.update({"running": True, "queued": False, "phase": "start"})
             _toolfail_state[tid] = st
@@ -2234,6 +2674,9 @@ def api_analyze_tool_failures(task_id: str, skip_download: bool = False):
     task = find_task(task_id)
     if not task:
         return JSONResponse({"success": False, "message": "任务不存在"}, status_code=404)
+    if task_is_aged(task):
+        return JSONResponse({"success": False, "message": "该任务已老化，原始轨迹已删除，无法再次统计工具失败"},
+                            status_code=410)
     if task.get("source_type") != "workspace":
         return JSONResponse(
             {"success": False, "message": "仅 workspace 来源的任务支持工具失败统计"},
@@ -2282,6 +2725,9 @@ def api_download_origin(task_id: str):
     task = find_task(task_id)
     if not task:
         return JSONResponse({"success": False, "message": "任务不存在"}, status_code=404)
+    if task_is_aged(task):
+        return JSONResponse({"success": False, "message": "该任务已老化，原始轨迹已删除，无法再下载"},
+                            status_code=410)
 
     od = origin_dir(task["output_dir"])
     if not od.is_dir() or not any(od.iterdir()):
@@ -2352,6 +2798,9 @@ def api_session_workspace_prepare(task_id: str, session: str):
     task = find_task(task_id)
     if not task:
         return JSONResponse({"success": False, "message": "任务不存在"}, status_code=404)
+    if task_is_aged(task):
+        return JSONResponse({"success": False, "message": "该任务已老化，原始轨迹已删除，无法再下载 workspace"},
+                            status_code=410)
     if task.get("source_type") != "workspace":
         return JSONResponse({"success": False, "message": "仅 workspace 来源的任务支持下载全量 workspace"},
                             status_code=400)
@@ -2449,6 +2898,9 @@ def api_session_workspace_cache(task_id: str, session: str):
     task = find_task(task_id)
     if not task:
         return JSONResponse({"success": False, "message": "任务不存在"}, status_code=404)
+    if task_is_aged(task):
+        return JSONResponse({"success": False, "message": "该任务已老化，原始轨迹已删除，无法再缓存 workspace"},
+                            status_code=410)
     if task.get("source_type") != "workspace":
         return JSONResponse({"success": False, "message": "仅 workspace 来源的任务支持缓存全量 workspace"},
                             status_code=400)
@@ -2708,6 +3160,9 @@ def api_signature_decode_start(task_id: str, session: str, force: int = 0, limit
     task = find_task(task_id)
     if not task:
         return JSONResponse({"success": False, "message": "任务不存在"}, status_code=404)
+    if task_is_aged(task):
+        return JSONResponse({"success": False, "message": "该任务已老化，原始轨迹已删除，无法进行 signature 解码"},
+                            status_code=410)
     if task.get("source_type") != "workspace":
         return JSONResponse({"success": False, "message": "仅 workspace 来源的任务支持 signature 解码"},
                             status_code=400)

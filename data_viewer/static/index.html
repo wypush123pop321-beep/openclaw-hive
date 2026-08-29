@@ -131,6 +131,22 @@ body{
 .traj-sig-text{flex:1;min-width:0}
 .traj-sig-copy{flex-shrink:0;font-size:10px;color:var(--text-1);border:1px solid var(--border);border-radius:3px;padding:0 4px}
 .traj-sig-copy.copied{color:var(--neon-green);border-color:rgba(0,255,168,.4)}
+/* signature 合规校验徽标(默认解析: 解码后 model name 是否含 claude) */
+.sig-verdict{flex-shrink:0;font-size:10px;border-radius:3px;padding:0 5px;font-weight:700;font-family:ui-monospace,monospace;cursor:help}
+.sig-verdict.ok{color:var(--neon-green);background:rgba(0,255,168,.08);border:1px solid rgba(0,255,168,.4)}
+.sig-verdict.mismatch{color:#ff6b6b;background:rgba(255,80,80,.08);border:1px solid rgba(255,80,80,.45)}
+.sig-verdict.corrupt{color:var(--neon-amber);background:rgba(255,194,60,.08);border:1px solid rgba(255,194,60,.4)}
+.traj-sig-summary{margin-left:8px;font-size:10px;font-weight:600}
+.traj-sig-summary .ok{color:var(--neon-green)}
+.traj-sig-summary .mismatch{color:#ff6b6b}
+.traj-sig-summary .corrupt{color:var(--neon-amber)}
+.traj-sig-chip.mismatch{border-color:rgba(255,80,80,.5)}
+.traj-sig-chip.corrupt{border-color:rgba(255,194,60,.4)}
+/* chip 上直接可见的解码模型名 */
+.sig-decoded-name{flex-shrink:0;font-size:10px;font-family:ui-monospace,monospace;border-radius:3px;padding:0 5px;cursor:help;white-space:nowrap}
+.sig-decoded-name.ok{color:var(--neon-green);background:rgba(0,255,168,.06)}
+.sig-decoded-name.mismatch{color:#ff6b6b;background:rgba(255,80,80,.06)}
+.sig-decoded-name.corrupt{color:var(--neon-amber);background:rgba(255,194,60,.06)}
 /* signature 解码: 工具栏 + 对比面板 */
 .sig-toolbar{display:flex;align-items:center;gap:10px;margin-top:10px;padding:8px 10px;background:var(--bg-1);border:1px solid var(--border);border-radius:6px;flex-wrap:wrap}
 .sig-hint{font-size:11px;color:var(--text-2)}
@@ -190,6 +206,8 @@ body{
 .traj-tab:hover{color:var(--text-0)}
 .traj-tab.active{color:var(--neon-cyan);border-bottom-color:var(--neon-cyan);font-weight:600}
 .traj-tab-disabled{color:var(--text-2);cursor:default;font-size:11px}
+.file-traj-item:hover{background:rgba(0,217,255,.06)}
+.file-traj-item.active{background:rgba(0,217,255,.12);outline:1px solid var(--neon-cyan)}
 .task-name-link{color:var(--neon-cyan);cursor:pointer;font-weight:600}
 .task-name-link:hover{text-decoration:underline}
 .task-obs{font-family:ui-monospace,monospace;font-size:11px;color:var(--text-2)}
@@ -226,6 +244,7 @@ body{
     <span v-if="jobStatus.running" style="font-size:11px;color:var(--neon-amber);font-family:ui-monospace,monospace">已运行 {{ elapsedSeconds }}s</span>
     <el-button v-if="jobStatus.running" size="small" type="danger" @click="stopJob">终止采集</el-button>
     <el-tag v-if="jobStatus.queue_len > 0" type="info" size="small" title="按登记顺序排队等待采集">队列 {{ jobStatus.queue_len }} 个等待</el-tag>
+    <el-button size="small" @click="openFileTraj" title="输入本地轨迹文件绝对路径并可视化查看（独立于采集任务）">📂 打开指定轨迹</el-button>
     <el-button size="small" type="primary" @click="openTaskForm">登记采集任务</el-button>
   </div>
 </div>
@@ -397,31 +416,87 @@ body{
             <span v-else style="color:var(--text-2)" :title="row.win_stats ? '旧口径统计已过期, 请重新点「统计工具失败」' : '尚未统计, 点操作列「统计工具失败」生成'">—</span>
           </template>
         </el-table-column>
+        <el-table-column label="①不存在工具 轨迹数/占比" width="150" align="center">
+          <template #default="{row}">
+            <template v-if="toolFailState[row.id] && (toolFailState[row.id].running || toolFailState[row.id].queued)">
+              <span style="font-size:11px;color:var(--text-2)">随「统计工具失败」一并计算</span>
+            </template>
+            <template v-else-if="row.win_stats && 'traj_with_r1' in row.win_stats">
+              <span style="font-family:ui-monospace,monospace;font-size:12px;color:var(--neon-orange,#ffb454)"
+                :title="'规则①=调用了本环境不存在的工具: toolResult 回「Tool X not found」(任意 X: Claude-Code/Windows 工具名、被误当工具的 shell 命令、拼写幻觉) 或 toolCall 名命中 Windows 工具名。命中该规则的轨迹 '+row.win_stats.traj_with_r1+' / 总轨迹 '+row.win_stats.traj_total+' 条。注: 一条轨迹可同时命中多条规则, 故 ①+②+③ 之和 ≥ 汇总「工具误用」轨迹数'">
+                {{ (row.win_stats.traj_with_r1||0).toLocaleString() }}
+                <span style="color:var(--text-2);font-size:11px">/ {{ ((row.win_stats.r1_traj_rate||0)*100).toFixed(1) }}%</span>
+              </span>
+            </template>
+            <span v-else style="color:var(--text-2)" :title="row.win_stats ? '旧口径统计已过期, 请重新点「统计工具失败」' : '尚未统计, 点操作列「统计工具失败」生成'">—</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="②file_path入参 轨迹数/占比" width="150" align="center">
+          <template #default="{row}">
+            <template v-if="toolFailState[row.id] && (toolFailState[row.id].running || toolFailState[row.id].queued)">
+              <span style="font-size:11px;color:var(--text-2)">随「统计工具失败」一并计算</span>
+            </template>
+            <template v-else-if="row.win_stats && 'traj_with_r2' in row.win_stats">
+              <span style="font-family:ui-monospace,monospace;font-size:12px;color:var(--neon-cyan,#4dd0e1)"
+                :title="'规则②=工具入参含 file_path 键(Windows 版 write/read 的参数名)。命中该规则的轨迹 '+row.win_stats.traj_with_r2+' / 总轨迹 '+row.win_stats.traj_total+' 条。仅看入参本身, 不进 content 正文载荷'">
+                {{ (row.win_stats.traj_with_r2||0).toLocaleString() }}
+                <span style="color:var(--text-2);font-size:11px">/ {{ ((row.win_stats.r2_traj_rate||0)*100).toFixed(1) }}%</span>
+              </span>
+            </template>
+            <span v-else style="color:var(--text-2)" :title="row.win_stats ? '旧口径统计已过期, 请重新点「统计工具失败」' : '尚未统计, 点操作列「统计工具失败」生成'">—</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="③Windows路径 轨迹数/占比" width="150" align="center">
+          <template #default="{row}">
+            <template v-if="toolFailState[row.id] && (toolFailState[row.id].running || toolFailState[row.id].queued)">
+              <span style="font-size:11px;color:var(--text-2)">随「统计工具失败」一并计算</span>
+            </template>
+            <template v-else-if="row.win_stats && 'traj_with_r3' in row.win_stats">
+              <span style="font-family:ui-monospace,monospace;font-size:12px;color:var(--neon-purple,#b39ddb)"
+                :title="'规则③=工具入参为 Windows 风格路径值(盘符开头 C:\\ / D:/)。命中该规则的轨迹 '+row.win_stats.traj_with_r3+' / 总轨迹 '+row.win_stats.traj_total+' 条。仅看入参本身, 不进 content 正文载荷'">
+                {{ (row.win_stats.traj_with_r3||0).toLocaleString() }}
+                <span style="color:var(--text-2);font-size:11px">/ {{ ((row.win_stats.r3_traj_rate||0)*100).toFixed(1) }}%</span>
+              </span>
+            </template>
+            <span v-else style="color:var(--text-2)" :title="row.win_stats ? '旧口径统计已过期, 请重新点「统计工具失败」' : '尚未统计, 点操作列「统计工具失败」生成'">—</span>
+          </template>
+        </el-table-column>
         <el-table-column label="状态" width="100" align="center">
           <template #default="{row}">
             <el-tag v-if="jobStatus.running && jobStatus.task_id === row.id" type="warning" size="small">采集中</el-tag>
             <el-tag v-else-if="queuePosition(row.id) > 0" type="info" size="small">排队中(第{{ queuePosition(row.id) }}位)</el-tag>
+            <el-tag v-else-if="row.aged" type="danger" size="small" effect="dark">已老化</el-tag>
             <el-tag v-else-if="row.last_exit_code === 0" type="success" size="small">成功</el-tag>
             <el-tag v-else-if="row.last_exit_code !== null && row.last_exit_code !== undefined" type="danger" size="small">失败</el-tag>
             <el-tag v-else type="info" size="small">未运行</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="560" align="center">
+        <el-table-column label="操作" width="640" align="center">
           <template #default="{row}">
             <el-button v-if="queuePosition(row.id) > 0" size="small" text type="danger" @click="cancelQueue(row)">取消排队</el-button>
             <el-button v-else size="small" text :disabled="jobStatus.running && jobStatus.task_id === row.id" @click="retriggerTask(row)">重新采集</el-button>
-            <el-button size="small" text :disabled="!row.available" @click="downloadOrigin(row)">下载原始轨迹</el-button>
-            <el-button size="small" text :disabled="!row.available || (toolFailState[row.id] && (toolFailState[row.id].running || toolFailState[row.id].queued))"
+            <el-button size="small" text :disabled="!row.available || row.aged" @click="downloadOrigin(row)">下载原始轨迹</el-button>
+            <el-button size="small" text :disabled="!row.available || row.aged || (toolFailState[row.id] && (toolFailState[row.id].running || toolFailState[row.id].queued))"
               :loading="toolFailState[row.id] && toolFailState[row.id].running" @click="analyzeToolFailures(row)">
               {{ toolFailState[row.id] && toolFailState[row.id].running ? '统计中…' : (toolFailState[row.id] && toolFailState[row.id].queued ? '排队中…' : '统计工具失败') }}
             </el-button>
-            <el-button size="small" text type="warning" :disabled="!row.available || (toolFailState[row.id] && (toolFailState[row.id].running || toolFailState[row.id].queued))"
+            <el-button size="small" text type="warning" :disabled="!row.available || row.aged || (toolFailState[row.id] && (toolFailState[row.id].running || toolFailState[row.id].queued))"
               :loading="toolFailState[row.id] && toolFailState[row.id].running" @click="analyzeToolFailures(row, true)"
               title="跳过增量下载，直接用本地已下载的轨迹统计（本地轨迹不完整时结果会偏少）">
               {{ toolFailState[row.id] && toolFailState[row.id].running ? '统计中…' : (toolFailState[row.id] && toolFailState[row.id].queued ? '排队中…' : '跳过下载统计') }}
             </el-button>
             <el-button size="small" text @click="openRenameForm(row)">重命名</el-button>
             <el-button size="small" text @click="openGroupsForm(row)">编辑分组</el-button>
+            <el-popconfirm
+              :title="row.aged ? '该任务已老化，如需恢复原始数据请点「重新采集」。' : '老化后仅保留统计信息，原始轨迹数据将被删除，此操作不可恢复。确定老化该任务吗？'"
+              confirm-button-text="老化" cancel-button-text="取消" @confirm="ageTask(row)">
+              <template #reference>
+                <el-button size="small" text type="warning" :disabled="row.aged || (jobStatus.running && jobStatus.task_id === row.id)"
+                  :title="row.aged ? '该任务已老化，原始数据已删除，仅保留统计信息' : '仅保留统计信息，删除原始轨迹数据以节省磁盘'">
+                  {{ row.aged ? '已老化' : '老化' }}
+                </el-button>
+              </template>
+            </el-popconfirm>
             <el-popconfirm title="确定删除该任务及其采集到的所有数据吗？此操作不可恢复。" confirm-button-text="删除" cancel-button-text="取消" @confirm="deleteTask(row)">
               <template #reference>
                 <el-button size="small" text type="danger" :disabled="jobStatus.running && jobStatus.task_id === row.id">删除</el-button>
@@ -455,6 +530,8 @@ body{
 
     <el-alert v-if="!activeTask.available && !(jobStatus.running && jobStatus.task_id === activeTaskId)" title="该任务尚无数据" type="info" show-icon :closable="false"
       description="可能仍在采集中，或采集尚未成功，可点击下方「重新采集」。" style="margin-bottom:18px"></el-alert>
+    <el-alert v-if="activeTask.aged" title="该任务已老化" type="warning" show-icon :closable="false" style="margin-bottom:18px"
+      description="原始轨迹数据已删除，仅保留统计信息。下方会话列表与各项统计仍可查看；如需恢复原始数据，请点「重新采集」从 OBS 重新拉取。"></el-alert>
 
     <div class="panel" v-if="activeTask.available || sessions.length">
       <div class="tbl-hdr">
@@ -685,11 +762,11 @@ body{
       <el-descriptions-item label="Session ID">
         <span style="font-family:ui-monospace,monospace;font-size:12px;color:var(--neon-cyan);word-break:break-all">{{ selectedSession.session }}</span>
         <el-button v-if="isWorkspaceTask" size="small" text type="primary" style="margin-left:12px"
-          :disabled="wsDownloading" :loading="wsDownloading" @click="downloadSessionWorkspace">
+          :disabled="wsDownloading || activeTask.aged" :loading="wsDownloading" @click="downloadSessionWorkspace">
           {{ wsDownloading ? '打包中…' : '下载全量 workspace' }}
         </el-button>
         <el-button v-if="isWorkspaceTask" size="small" text type="success" style="margin-left:6px"
-          :disabled="wsCaching" :loading="wsCaching" @click="cacheSessionWorkspace"
+          :disabled="wsCaching || activeTask.aged" :loading="wsCaching" @click="cacheSessionWorkspace"
           title="从 OBS 把该会话全量 workspace 拉到本地 origin, 长期保留(不经浏览器下载)">
           {{ wsCaching ? '缓存中…' : '缓存全量 workspace' }}
         </el-button>
@@ -722,7 +799,8 @@ body{
     </el-descriptions>
 
     <div class="traj-section">
-      <el-button v-if="!trajLoaded && !trajLoading" size="small" @click="loadTrajectory" style="width:100%">
+      <el-alert v-if="activeTask.aged && !trajLoaded && !trajLoading" title="该任务已老化，原始轨迹已删除，无法查看具体轨迹 / log" type="warning" show-icon :closable="false"></el-alert>
+      <el-button v-else-if="!trajLoaded && !trajLoading" size="small" @click="loadTrajectory" style="width:100%">
         查看具体轨迹
       </el-button>
       <div v-if="trajLoading" class="traj-loading">
@@ -859,8 +937,17 @@ body{
                 </span>
               </div>
               <div v-if="m.thinking_signatures && m.thinking_signatures.length" class="traj-sig-block">
-                <div class="traj-sig-head">🧠 thinkingSignature ×{{ m.thinking_signatures.length }}</div>
-                <div v-for="(s, si) in m.thinking_signatures" :key="si" class="traj-sig-chip" :title="s" @click="copySig(i, si)">
+                <div class="traj-sig-head">
+                  🧠 thinkingSignature ×{{ m.thinking_signatures.length }}
+                  <span v-if="sigCheckSummary(m)" class="traj-sig-summary">
+                    <span class="ok" v-if="sigCheckSummary(m).ok">✅合规 {{ sigCheckSummary(m).ok }}</span>
+                    <span class="mismatch" v-if="sigCheckSummary(m).mismatch"> ❌模型不符 {{ sigCheckSummary(m).mismatch }}</span>
+                    <span class="corrupt" v-if="sigCheckSummary(m).corrupt"> ⚠️签名损坏 {{ sigCheckSummary(m).corrupt }}</span>
+                  </span>
+                </div>
+                <div v-for="(s, si) in m.thinking_signatures" :key="si" class="traj-sig-chip" :class="sigVerdict(m, si)" :title="s" @click="copySig(i, si)">
+                  <span v-if="sigVerdict(m, si)" class="sig-verdict" :class="sigVerdict(m, si)" :title="sigVerdictTitle(m, si)">{{ sigVerdictLabel(m, si) }}</span>
+                  <span v-if="sigVerdict(m, si)" class="sig-decoded-name" :class="sigVerdict(m, si)" :title="sigVerdictTitle(m, si)">{{ sigDecodedName(m, si) }}</span>
                   <span class="traj-sig-text">{{ displaySig(s) }}</span>
                   <span class="traj-sig-copy" :class="{copied: isSigCopied(i, si)}">{{ isSigCopied(i, si) ? '✓ 已复制' : '📋 复制' }}</span>
                 </div>
@@ -918,6 +1005,114 @@ body{
           </div>
         </div>
       </div>
+    </div>
+  </template>
+</el-dialog>
+
+<!-- 打开指定轨迹文件 Dialog(独立于任务/会话) -->
+<el-dialog v-model="fileTrajVisible" title="打开指定轨迹文件" width="90vw" destroy-on-close class="traj-dialog">
+  <div style="display:flex;gap:8px;margin-bottom:12px">
+    <el-input v-model="fileTrajPath" placeholder="输入本地轨迹 jsonl / json 文件绝对路径" clearable
+      @keyup.enter="loadFileTraj" style="flex:1"></el-input>
+    <el-button type="primary" :loading="fileTrajLoading" @click="loadFileTraj">加载</el-button>
+  </div>
+
+  <el-alert v-if="fileTrajError" :title="fileTrajError" type="error" show-icon :closable="false" style="margin-bottom:12px"></el-alert>
+
+  <template v-if="fileTrajData && fileTraj">
+    <!-- 多轨迹选择器(文件每行一条完整对话时, 随惰性加载逐页累积) -->
+    <div v-if="fileTrajData.trajectories.length > 1" class="file-traj-select"
+      style="margin-bottom:10px;display:flex;flex-direction:column;gap:4px;max-height:150px;overflow:auto;border:1px solid var(--border);border-radius:6px;padding:6px">
+      <div v-for="t in fileTrajData.trajectories" :key="t.index" class="file-traj-item"
+        :class="{active: t.index === fileTrajIndex}"
+        style="cursor:pointer;padding:5px 8px;border-radius:4px;font-size:12px;display:flex;align-items:center;gap:8px"
+        @click="selectFileTraj(t.index)">
+        <span class="traj-caret">{{ t.index === fileTrajIndex ? '▼' : '▶' }}</span>
+        <span style="font-family:ui-monospace,monospace;color:var(--neon-cyan)">#{{ t.index + 1 }}</span>
+        <span>共 {{ t.message_count }} 条消息</span>
+        <template v-if="t.meta">
+          <span v-if="t.meta.rounds">· {{ t.meta.rounds }} rounds</span>
+          <span v-if="t.meta.tokens">· {{ t.meta.tokens.toLocaleString() }} tokens</span>
+          <span v-if="t.meta.tool_num">· {{ t.meta.tool_num }} tools</span>
+          <span v-if="t.meta.complete_result !== undefined" :style="{color: t.meta.complete_result ? 'var(--neon-green)' : 'var(--neon-amber)'}">· complete={{ t.meta.complete_result }}</span>
+          <span v-if="t.meta.is_skill !== undefined" :style="{color: t.meta.is_skill ? 'var(--neon-purple)' : 'var(--text-2)'}">· {{ t.meta.is_skill ? 'skill' : '普通' }}</span>
+        </template>
+        <span v-if="t.meta && t.meta.reject" class="traj-badge-err"
+          :title="'拒检: ' + (t.meta.reject.reject_reasons || []).join(', ') + '\nsource: ' + (t.meta.reject.source_file || '') + ' @ line ' + (t.meta.reject.line_no || '')">
+          ✗ 拒检 {{ (t.meta.reject.reject_reasons || []).length }} 项
+        </span>
+        <span v-if="t.meta && t.meta.path" style="margin-left:auto;color:var(--text-2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:40%"
+          :title="t.meta.path">{{ t.meta.path }}</span>
+      </div>
+    </div>
+
+    <!-- 消息查看器 -->
+    <div class="traj-viewer">
+      <div class="traj-meta">
+        <span>
+          共 {{ fileTraj.message_count }} 条消息
+          <span v-if="fileTraj.meta && fileTraj.meta.path" :title="fileTraj.meta.path"
+            style="font-family:ui-monospace,monospace;color:var(--text-1)"> · {{ fileTraj.meta.path.split('/').pop() }}</span>
+          <template v-if="fileTraj.meta && fileTraj.meta.reject">
+            <span class="traj-badge-err" :title="'source: ' + (fileTraj.meta.reject.source_file || '') + ' @ line ' + (fileTraj.meta.reject.line_no || '')"
+              style="max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:inline-block;vertical-align:middle">
+              ✗ 拒检: {{ (fileTraj.meta.reject.reject_reasons || []).join(', ') }}
+            </span>
+          </template>
+          <template v-if="fileTrajData.trajectories.length > 1"> · 轨迹 #{{ fileTrajIndex + 1 }}</template>
+        </span>
+        <span class="traj-toolbar">
+          <el-button size="small" text @click="fileCollapseAll(true)">全部折叠</el-button>
+          <el-button size="small" text @click="fileCollapseAll(false)">全部展开</el-button>
+        </span>
+      </div>
+      <div class="traj-msg" v-for="(m, i) in fileTraj.messages" :key="i" :class="'role-' + m.role">
+        <div class="traj-msg-role" @click="toggleFileMsg(i)" style="cursor:pointer;user-select:none">
+          <span class="traj-caret">{{ isFileMsgCollapsed(i) ? '▶' : '▼' }}</span> {{ roleLabel(m.role) }}
+        </div>
+        <div class="traj-msg-body">
+          <div v-if="isFileMsgCollapsed(i)" class="traj-collapsed-hint" @click="toggleFileMsg(i)">（已折叠，点击展开）</div>
+          <template v-else>
+            <div v-if="m.role === 'toolResult' && (m.tool_name || m.is_error || m.exit_code !== undefined)" class="traj-tr-head">
+              <span v-if="m.tool_name" class="traj-tr-tool">⚙ {{ m.tool_name }}</span>
+              <span v-if="m.is_error || (m.exit_code !== undefined && m.exit_code !== 0)" class="traj-badge-err">
+                ✗ 失败<template v-if="m.exit_code !== undefined && m.exit_code !== 0"> · exit {{ m.exit_code }}</template>
+              </span>
+              <span v-else-if="m.exit_code === 0" class="traj-badge-ok">exit 0</span>
+            </div>
+            <div v-if="m.reasoning_content" class="traj-reasoning">
+              <span>{{ displayFileText(m.reasoning_content, i, 'r') }}</span>
+              <span v-if="isFileLong(m.reasoning_content)" class="traj-more" @click="toggleFileText(i, 'r')">
+                {{ isFileTextExpanded(i, 'r') ? ' 收起 ▲' : ' …展开看全文 ▼' }}
+              </span>
+            </div>
+            <div v-if="m.content" class="traj-content">
+              <span>{{ displayFileText(m.content, i, 'c') }}</span>
+              <span v-if="isFileLong(m.content)" class="traj-more" @click="toggleFileText(i, 'c')">
+                {{ isFileTextExpanded(i, 'c') ? ' 收起 ▲' : ' …展开看全文 ▼' }}
+              </span>
+            </div>
+            <div v-if="m.tool_calls && m.tool_calls.length" class="traj-toolcalls">
+              <div v-for="(tc, j) in m.tool_calls" :key="j" class="traj-toolcall">
+                🔧 {{ tc.name }}<span v-if="tc.arguments">({{ tc.arguments }})</span>
+              </div>
+            </div>
+          </template>
+        </div>
+      </div>
+    </div>
+
+    <!-- 惰性分页: 每页 10 条; 输入页码直接跳页, 或点「加载下一页」续读; 不统计总数 -->
+    <div v-if="fileTrajData && (fileTrajData.format === 'reflected' || fileTrajData.format === 'rejected')"
+      style="margin-top:12px;display:flex;align-items:center;gap:8px;justify-content:center;flex-wrap:wrap">
+      <span style="color:var(--text-2);font-size:12px">跳至</span>
+      <el-input v-model="fileTrajJumpPage" type="number" min="1" size="small" style="width:80px"
+        placeholder="页码" @keyup.enter="jumpFileTraj"></el-input>
+      <el-button size="small" :loading="fileTrajLoadingMore" @click="jumpFileTraj">跳转</el-button>
+      <el-button v-if="fileTrajHasMore" size="small" :loading="fileTrajLoadingMore" @click="loadFileTrajMore">加载下一页 ▾</el-button>
+      <span v-if="fileTrajData && !fileTrajHasMore && fileTrajData.trajectories.length" style="color:var(--text-2);font-size:12px">
+        已到文件末尾 · 自轨迹 #{{ (fileTrajData.start || 0) + 1 }} 起共 {{ fileTrajData.trajectories.length }} 条
+      </span>
     </div>
   </template>
 </el-dialog>
@@ -997,6 +1192,17 @@ createApp({
       textExpanded: {},   // 详情: 长文本是否展开看全文, key = `${tab}:${i}:${kind}`
       sigCopied: {},      // 详情: thinkingSignature 复制反馈, key = `${tab}:${i}:sig${si}`
       _sigCopiedTimer: null,
+      // 打开指定轨迹文件(独立于任务/会话)
+      fileTrajVisible: false,
+      fileTrajPath: '/home/w00802407/workspace/0813_trajectories_post_handle/0813_cc_tkfly_failed_handle/search_year误杀筛选_out/recovered/pangu_1_00001_reflected.jsonl',
+      fileTrajLoading: false,
+      fileTrajLoadingMore: false,  // 惰性分页: 加载下一页 / 跳页进行中
+      fileTrajJumpPage: 1,         // 惰性分页: 跳页输入(页码)
+      fileTrajError: '',
+      fileTrajData: null,   // {found, source_file, format, offset, start, count, has_more, next_offset, trajectories: [...]}
+      fileTrajIndex: 0,
+      fileMsgCollapsed: {}, // 文件轨迹: 消息折叠, key = `${index}:${i}`
+      fileTextExpanded: {}, // 文件轨迹: 长文本展开, key = `${index}:${i}:${kind}`
       sigDecodeRunning: false,  // 解码任务进行中
       sigDecodePhase: '',       // start/download/convert/reflect/done/error
       sigDecodeProgress: 0,
@@ -1037,6 +1243,16 @@ createApp({
       if (!this.trajData) return null
       if (this.trajTab === 'evaluator') return this.trajData.evaluator || null
       return this.trajData
+    },
+    fileTraj() {
+      if (!this.fileTrajData || !this.fileTrajData.trajectories) return null
+      const list = this.fileTrajData.trajectories
+      // fileTrajIndex 为全局轨迹序号(跳页后可能是 90 等), 需在列表内按 index 定位
+      for (const t of list) if (t.index === this.fileTrajIndex) return t
+      return list[0] || null
+    },
+    fileTrajHasMore() {
+      return !!(this.fileTrajData && this.fileTrajData.has_more)
     },
     currentTrajTokens() {
       // 根据当前 tab 返回对应轨迹的 token 信息
@@ -1417,11 +1633,34 @@ createApp({
         ElementPlus.ElMessage.error(e.response?.data?.message || '删除失败，请检查后端服务')
       }
     },
+    async ageTask(task) {
+      // 老化: 仅保留统计信息(filter_stats.json), 删除原始轨迹数据(origin/_sigdecode), 节省磁盘。
+      try {
+        const r = await axios.post(`/api/tasks/${task.id}/age`)
+        if (r.data.success) {
+          ElementPlus.ElMessage.success(r.data.message || '任务已老化')
+          await Promise.all([this.loadTasks(), this.loadStats()])
+          // 若正停留在该任务详情/会话详情, 清理已加载的轨迹数据, 避免展示过期内容
+          if (this.activeTaskId === task.id) {
+            this.trajLoaded = false; this.trajData = null; this.trajError = ''
+            this.logData = null; this.logError = ''
+          }
+        } else {
+          ElementPlus.ElMessage.error(r.data.message || '老化失败')
+        }
+      } catch (e) {
+        ElementPlus.ElMessage.error(e.response?.data?.message || '老化失败，请检查后端服务')
+      }
+    },
     downloadOrigin(task) {
       // 原始轨迹目录可达数 GB, 直接走浏览器原生下载(后端流式 tar), 不经 axios, 避免超时/占内存。
       // 后端已按任务名生成文件名, 用隐藏 <a> 触发下载即可。
       if (!task.available) {
         ElementPlus.ElMessage.warning('该任务暂无原始轨迹数据可下载')
+        return
+      }
+      if (task.aged) {
+        ElementPlus.ElMessage.warning('该任务已老化，原始轨迹已删除，无法下载')
         return
       }
       const url = `/api/tasks/${task.id}/download-origin`
@@ -1438,6 +1677,10 @@ createApp({
       // skipDownload=true 时跳过增量下载, 直接用本地轨迹统计(快速路径)。
       if (!task.available) {
         ElementPlus.ElMessage.warning('该任务暂无可分析的轨迹数据')
+        return
+      }
+      if (task.aged) {
+        ElementPlus.ElMessage.warning('该任务已老化，原始轨迹已删除，无法再次统计工具失败')
         return
       }
       try {
@@ -1516,6 +1759,10 @@ createApp({
     async downloadSessionWorkspace() {
       // 全量 workspace 可能较大: 先 POST prepare 让后端后台拉取, 轮询到 ready 再触发浏览器原生下载。
       if (!this.selectedSession) return
+      if (this.activeTask && this.activeTask.aged) {
+        ElementPlus.ElMessage.warning('该任务已老化，原始轨迹已删除，无法下载 workspace')
+        return
+      }
       const s = this.selectedSession.session
       const base = `/api/tasks/${this.activeTaskId}/session-workspace/${encodeURIComponent(s)}`
       this.wsDownloading = true
@@ -1552,6 +1799,10 @@ createApp({
     async cacheSessionWorkspace() {
       // 把该会话全量 workspace 从 OBS 拉到本地 origin 长期保留(不经浏览器下载), 后台执行并轮询。
       if (!this.selectedSession) return
+      if (this.activeTask && this.activeTask.aged) {
+        ElementPlus.ElMessage.warning('该任务已老化，原始轨迹已删除，无法缓存 workspace')
+        return
+      }
       const s = this.selectedSession.session
       const base = `/api/tasks/${this.activeTaskId}/session-workspace/${encodeURIComponent(s)}`
       this.wsCaching = true
@@ -1688,8 +1939,139 @@ createApp({
       this.sigDecodeCached = false
       this.sigDecodeResults = []
       this.msgDecodeOpen = {}
-      // workspace 任务: 点开即自动加载 log(文件已本地缓存), 无需点「查看具体轨迹」
-      if (this.isWorkspaceTask) this.loadTaskLog()
+      // workspace 任务: 点开即自动加载 log(文件已本地缓存), 无需点「查看具体轨迹」。
+      // 已老化的任务原始数据已删, 跳过自动加载(面板上会显示老化提示)
+      if (this.isWorkspaceTask && !this.activeTask.aged) this.loadTaskLog()
+    },
+    // ── 打开指定轨迹文件(独立于任务/会话) ──
+    openFileTraj() {
+      this.fileTrajVisible = true
+      this.fileTrajError = ''
+      // 已有数据直接复用; 首次打开自动加载默认路径
+      if (!this.fileTrajData && this.fileTrajPath.trim()) this.loadFileTraj()
+    },
+    async loadFileTraj() {
+      if (!this.fileTrajPath || !this.fileTrajPath.trim()) {
+        this.fileTrajError = '请先输入轨迹文件路径'
+        return
+      }
+      this.fileTrajLoading = true
+      this.fileTrajError = ''
+      try {
+        // 惰性分页: 首页只取前 10 条, 不统计总数, 秒开
+        const r = await axios.get('/api/load-trajectory-file', {
+          params: { path: this.fileTrajPath.trim(), offset: 0, limit: 10, start: 0 },
+        })
+        if (r.data.found) {
+          this.fileTrajData = r.data
+          this.fileTrajIndex = 0
+          this.fileTrajJumpPage = 1
+          this.fileMsgCollapsed = {}
+          this.fileTextExpanded = {}
+        } else {
+          this.fileTrajError = r.data.message || '无法加载该轨迹文件'
+          this.fileTrajData = null
+        }
+      } catch (e) {
+        this.fileTrajError = e.response?.data?.message || '加载轨迹文件失败，请检查后端服务'
+        this.fileTrajData = null
+      } finally {
+        this.fileTrajLoading = false
+      }
+    },
+    async loadFileTrajMore() {
+      const d = this.fileTrajData
+      if (!d || !d.has_more || this.fileTrajLoadingMore) return
+      this.fileTrajLoadingMore = true
+      this.fileTrajError = ''
+      try {
+        const r = await axios.get('/api/load-trajectory-file', {
+          params: {
+            path: this.fileTrajPath.trim(),
+            offset: d.next_offset || 0,
+            limit: 10,
+            start: (d.start || 0) + (d.trajectories || []).length,
+          },
+        })
+        if (!r.data || !r.data.found) {
+          // 续读失败/文件已不可读: 提示并收尾, 保留已加载部分
+          this.fileTrajError = (r.data && r.data.message) || '无法加载更多轨迹'
+          this.fileTrajData = { ...d, has_more: false }
+          return
+        }
+        const added = r.data.trajectories || []
+        this.fileTrajData = {
+          ...d,
+          // 注意: 不覆盖 start —— 它要保持「列表首条轨迹的全局序号」, 供下一页 start 计算与页脚展示
+          has_more: !!r.data.has_more,
+          next_offset: r.data.next_offset,
+          trajectories: (d.trajectories || []).concat(added),
+        }
+        if (!added.length) this.fileTrajData.has_more = false // 续读页无更多数据, 收尾
+      } catch (e) {
+        this.fileTrajError = e.response?.data?.message || '加载下一页失败，请检查后端服务'
+      } finally {
+        this.fileTrajLoadingMore = false
+      }
+    },
+    async jumpFileTraj() {
+      if (this.fileTrajLoadingMore) return
+      const page = parseInt(this.fileTrajJumpPage, 10)
+      if (!page || page < 1) {
+        this.fileTrajError = '请输入有效页码（≥1）'
+        return
+      }
+      this.fileTrajLoadingMore = true
+      this.fileTrajError = ''
+      try {
+        // 跳页: 跳过前 (page-1)*limit 条有效轨迹, 仍走惰性读取; 超出范围由后端报错并附最大页数
+        const r = await axios.get('/api/load-trajectory-file', {
+          params: { path: this.fileTrajPath.trim(), jump: (page - 1) * 10, limit: 10 },
+        })
+        if (r.data.found) {
+          this.fileTrajData = r.data
+          this.fileTrajIndex = r.data.start || 0   // 选中本页第一条(全局序号)
+          this.fileTrajJumpPage = page
+          this.fileMsgCollapsed = {}
+          this.fileTextExpanded = {}
+        } else {
+          this.fileTrajError = r.data.message || '跳转页码超出范围'
+        }
+      } catch (e) {
+        // 后端 400: 携带「跳转页码超出范围：文件共 N 条轨迹，最多 M 页」等信息, 保留当前已加载数据
+        this.fileTrajError = e.response?.data?.message || '跳转失败，请检查后端服务'
+      } finally {
+        this.fileTrajLoadingMore = false
+      }
+    },
+    selectFileTraj(idx) {
+      this.fileTrajIndex = idx
+      this.fileMsgCollapsed = {}
+      this.fileTextExpanded = {}
+    },
+    // 文件轨迹消息折叠 / 长文本展开(key 带轨迹 index, 切换轨迹时互不串扰)
+    _fileMsgKey(i) { return this.fileTrajIndex + ':' + i },
+    _fileTxtKey(i, kind) { return this.fileTrajIndex + ':' + i + ':' + kind },
+    isFileMsgCollapsed(i) { return !!this.fileMsgCollapsed[this._fileMsgKey(i)] },
+    toggleFileMsg(i) {
+      const k = this._fileMsgKey(i)
+      this.fileMsgCollapsed = { ...this.fileMsgCollapsed, [k]: !this.fileMsgCollapsed[k] }
+    },
+    isFileLong(text) { return typeof text === 'string' && text.length > 600 },
+    isFileTextExpanded(i, kind) { return !!this.fileTextExpanded[this._fileTxtKey(i, kind)] },
+    toggleFileText(i, kind) {
+      const k = this._fileTxtKey(i, kind)
+      this.fileTextExpanded = { ...this.fileTextExpanded, [k]: !this.fileTextExpanded[k] }
+    },
+    displayFileText(text, i, kind) {
+      if (!this.isFileLong(text) || this.isFileTextExpanded(i, kind)) return text
+      return text.slice(0, 600)
+    },
+    fileCollapseAll(val) {
+      const msgs = (this.fileTraj && this.fileTraj.messages) || []
+      const next = {}
+      msgs.forEach((_, i) => { next[this._fileMsgKey(i)] = val })
+      this.fileMsgCollapsed = next
     },
     async loadTrajectory() {
       if (!this.selectedSession || !this.activeTaskId) return
@@ -1795,6 +2177,37 @@ createApp({
       return typeof s === 'string' && s.length > 48 ? s.slice(0, 48) + '…' : (s || '')
     },
     isSigCopied(i, si) { return !!this.sigCopied[this._sigKey(i, si)] },
+    // ── signature 合规校验(默认解析: 后端解码后判定是否含 claude) ──
+    sigVerdict(m, si) {
+      const c = m && m.signature_checks && m.signature_checks[si]
+      return c ? c.verdict : ''
+    },
+    sigVerdictLabel(m, si) {
+      return { ok: '✅', mismatch: '❌', corrupt: '⚠️' }[this.sigVerdict(m, si)] || ''
+    },
+    sigVerdictTitle(m, si) {
+      const c = m && m.signature_checks && m.signature_checks[si]
+      if (!c) return ''
+      const base = { ok: '合规: 解码含 claude', mismatch: '模型不符: 解码不含 claude', corrupt: '签名损坏: base64 解码失败' }[c.verdict] || ''
+      return c.model_hint ? base + '\n解码片段: ' + c.model_hint : base
+    },
+    sigDecodedName(m, si) {
+      const c = m && m.signature_checks && m.signature_checks[si]
+      if (!c) return ''
+      if (c.verdict === 'corrupt') return '解码失败'
+      // 从原始 model_hint 里抽出干净的模型名 token(字母数字 . _ -), 去掉尾部杂字节
+      const raw = c.model_hint || ''
+      const mt = raw.match(/(claude|glm|gpt|qwen|gemini|deepseek|ernie|doubao)[a-z0-9-]*/i)
+      if (mt) return mt[0].replace(/[-]+$/, '')
+      return c.verdict === 'ok' ? 'claude' : '无 claude'
+    },
+    sigCheckSummary(m) {
+      const cs = m && m.signature_checks
+      if (!cs || !cs.length) return null
+      const s = { ok: 0, mismatch: 0, corrupt: 0 }
+      cs.forEach(c => { if (c && s[c.verdict] !== undefined) s[c.verdict]++ })
+      return s
+    },
     copySig(i, si) {
       const msgs = (this.activeTrajData && this.activeTrajData.messages) || []
       const msg = msgs[i]
@@ -1828,6 +2241,10 @@ createApp({
     },
     async startSigDecode(force = false) {
       if (!this.selectedSession || !this.activeTaskId || this.sigDecodeRunning) return
+      if (this.activeTask && this.activeTask.aged) {
+        ElementPlus.ElMessage.warning('该任务已老化，原始轨迹已删除，无法进行 signature 解码')
+        return
+      }
       const s = this.selectedSession.session
       const base = `/api/tasks/${this.activeTaskId}/session-detail/${encodeURIComponent(s)}/signature-decode`
       try {

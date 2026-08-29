@@ -157,35 +157,42 @@ def download_trajectories(task: dict, progress=None) -> None:
 
 def _session_counts(task_dir: Path):
     """定位单个 session 的全量 assistant 轨迹并计数, 返回
-    (tool_calls, tool_fails, win_tool_calls, found)。
+    (tool_calls, tool_fails, win_tool_calls, r1, r2, r3, found)。
     优先 openclaw 的 agents/assistant*/sessions/*.jsonl(评测方 evaluator 不计; 无 assistant*
     时回退 main), 无则回退 Hermes 的 logs/trajectories/*/query*.json。都没有则
-    (0, 0, 0, False)。found 表示该 session 确实存在轨迹文件(无轨迹数据时不算「一条轨迹」,
-    不进分母)。一个 session 目录可能含多个轨迹文件(续跑/子 agent 各一份 jsonl, 或多个
+    (0, 0, 0, 0, 0, 0, False)。found 表示该 session 确实存在轨迹文件(无轨迹数据时不算「一条
+    轨迹」, 不进分母)。一个 session 目录可能含多个轨迹文件(续跑/子 agent 各一份 jsonl, 或多个
     query 子目录), 须逐个累加而非只取首个, 否则会漏计。
-    win_tool_calls = 该 session 内命中 Windows 信号的工具调用数(traj_stats._is_windows_tool_call)。
+    win_tool_calls = 该 session 内命中「工具误用/环境不符」宽口径的工具调用数;
+    r1/r2/r3 = 3 条规则各自命中的调用数(见 traj_stats.count_tool_rule_stats_*)。
     """
     # openclaw: assistant* 优先, 缺失才用 main, 避免二者并存时重复计数; 命中的这一类全部累加。
     for pattern in ("agents/assistant*/sessions/*.jsonl", "agents/main/sessions/*.jsonl"):
         jsonls = [p for p in sorted(task_dir.glob(pattern)) if "trajectory" not in p.name]
         if jsonls:
-            calls = fails = win = 0
+            calls = fails = win = r1 = r2 = r3 = 0
             for jsonl in jsonls:
-                c, f, w = traj_stats.count_tool_stats_openclaw(str(jsonl))
+                c, f, w, a1, a2, a3 = traj_stats.count_tool_rule_stats_openclaw(str(jsonl))
                 calls += c
                 fails += f
                 win += w
-            return (calls, fails, win, True)
+                r1 += a1
+                r2 += a2
+                r3 += a3
+            return (calls, fails, win, r1, r2, r3, True)
     # Hermes: 每个 trajectories 子目录一份 query*.json, 各自是一段 turn 集, 全部累加。
-    calls = fails = win = 0
+    calls = fails = win = r1 = r2 = r3 = 0
     found = False
     for q in sorted(task_dir.glob("logs/trajectories/*/query*.json")):
         found = True
-        c, f, w = traj_stats.count_tool_stats_query1(str(q))
+        c, f, w, a1, a2, a3 = traj_stats.count_tool_rule_stats_query1(str(q))
         calls += c
         fails += f
         win += w
-    return (calls, fails, win, found)
+        r1 += a1
+        r2 += a2
+        r3 += a3
+    return (calls, fails, win, r1, r2, r3, found)
 
 
 def analyze(task: dict, progress=None, now_iso: str = None, skip_download: bool = False) -> dict:
@@ -208,6 +215,8 @@ def analyze(task: dict, progress=None, now_iso: str = None, skip_download: bool 
     origin = origin_dir(task["output_dir"])
 
     total_calls = total_fails = total_win = analyzed = traj_with_fail = traj_with_win = 0
+    # 分规则「命中该规则的轨迹数」(一条轨迹可同时命中多条, 故三者之和 ≥ traj_with_win)
+    traj_with_r1 = traj_with_r2 = traj_with_r3 = 0
     n = len(sessions)
     if progress:
         progress(0, n, phase="analyze")
@@ -217,15 +226,17 @@ def analyze(task: dict, progress=None, now_iso: str = None, skip_download: bool 
             row["tool_calls"] = row.get("tool_calls", 0)
             row["tool_fail_count"] = 0
             row["win_tool_calls"] = 0
+            row["win_rule_calls"] = [0, 0, 0]
             continue
         task_dir = origin / session
         if task_dir.is_dir():
-            calls, fails, win, found = _session_counts(task_dir)
+            calls, fails, win, r1, r2, r3, found = _session_counts(task_dir)
         else:
-            calls, fails, win, found = 0, 0, 0, False
+            calls, fails, win, r1, r2, r3, found = 0, 0, 0, 0, 0, 0, False
         row["tool_calls"] = calls
         row["tool_fail_count"] = fails
         row["win_tool_calls"] = win
+        row["win_rule_calls"] = [r1, r2, r3]  # 该轨迹 3 条规则各自命中的调用数
         total_calls += calls
         total_fails += fails
         total_win += win
@@ -235,6 +246,12 @@ def analyze(task: dict, progress=None, now_iso: str = None, skip_download: bool 
                 traj_with_fail += 1
             if win > 0:
                 traj_with_win += 1
+            if r1 > 0:
+                traj_with_r1 += 1
+            if r2 > 0:
+                traj_with_r2 += 1
+            if r3 > 0:
+                traj_with_r3 += 1
         # 每次都显式带 phase="analyze": 下载监控线程 stop 时可能残留一记
         # phase="download" 的迟到写(mon.join 超时不杀线程), 不带上会被一直钉在下载阶段。
         if progress and (i % 200 == 0 or i == n - 1):
@@ -260,6 +277,14 @@ def analyze(task: dict, progress=None, now_iso: str = None, skip_download: bool 
         "traj_total": analyzed,
         "traj_with_win": traj_with_win,
         "win_traj_rate": round(traj_with_win / analyzed, 4) if analyzed else 0.0,
+        # 分规则命中的轨迹数(不动上面的汇总口径; 一条轨迹可同时命中多条规则):
+        #   r1 = 调用本环境不存在的工具; r2 = file_path 入参键; r3 = Windows 风格路径值。
+        "traj_with_r1": traj_with_r1,
+        "traj_with_r2": traj_with_r2,
+        "traj_with_r3": traj_with_r3,
+        "r1_traj_rate": round(traj_with_r1 / analyzed, 4) if analyzed else 0.0,
+        "r2_traj_rate": round(traj_with_r2 / analyzed, 4) if analyzed else 0.0,
+        "r3_traj_rate": round(traj_with_r3 / analyzed, 4) if analyzed else 0.0,
         "analyzed_at": now_iso,
     }
     data["win_stats"] = win_stats
